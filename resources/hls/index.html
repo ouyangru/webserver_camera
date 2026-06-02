@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HLS Live</title>
+  <style>
+    :root {
+      --bg: #0f141a;
+      --panel: #1b232b;
+      --accent: #ffb703;
+      --text: #e6edf3;
+      --muted: #8da0b3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      background: radial-gradient(1200px 800px at 20% 10%, #202a34, #0f141a);
+      color: var(--text);
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .wrap {
+      width: min(900px, 100%);
+      background: var(--panel);
+      border: 1px solid #25303a;
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 22px;
+      letter-spacing: 0.5px;
+    }
+    p { margin: 0 0 16px; color: var(--muted); }
+    video {
+      width: 100%;
+      background: #000;
+      border-radius: 12px;
+      border: 1px solid #2a3642;
+    }
+    .hint {
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    a { color: var(--accent); text-decoration: none; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.11"></script>
+</head>
+<body>
+  <div class="wrap">
+    <h1>HLS Live</h1>
+    <p>浏览器不支持 RTSP，请使用 HLS 播放。</p>
+    <video id="video" controls autoplay muted playsinline></video>
+    <div class="hint">播放源: <a href="./stream.m3u8">stream.m3u8</a></div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const src = './stream.m3u8';
+
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = src;
+    } else if (Hls.isSupported()) {
+      const hls = new Hls({
+        lowLatencyMode: true,
+        maxBufferLength: 2,
+        liveSyncDurationCount: 2
+      });
+      hls.loadSource(src);
+      hls.attachMedia(video);
+    } else {
+      video.outerHTML = '<p>当前浏览器不支持 HLS，请使用 Chrome/Edge 或 Safari。</p>';
+    }
+  </script>
+</body>
+</html>

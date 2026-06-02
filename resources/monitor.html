@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Monitor</title>
+  <style>
+    :root {
+      --bg-1: #0b1117;
+      --bg-2: #14202b;
+      --panel: #111a22;
+      --panel-2: #172430;
+      --accent: #f6c453;
+      --accent-2: #e1ff8a;
+      --text: #e8eef4;
+      --muted: #98a6b5;
+      --danger: #ff5d5d;
+      --ok: #46d369;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 700px at 10% 20%, #1d2a36, transparent 60%),
+        radial-gradient(800px 600px at 90% 10%, #202c39, transparent 60%),
+        linear-gradient(160deg, var(--bg-1), var(--bg-2));
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .shell {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: grid;
+      gap: 20px;
+      grid-template-columns: 1.5fr 1fr;
+    }
+    .card {
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      border: 1px solid #223142;
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 18px 40px rgba(0,0,0,0.3);
+      animation: rise 400ms ease-out;
+    }
+    @keyframes rise {
+      from { transform: translateY(8px); opacity: 0.7; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0.4px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--danger);
+      box-shadow: 0 0 12px rgba(255,93,93,0.6);
+    }
+    .dot.ok {
+      background: var(--ok);
+      box-shadow: 0 0 12px rgba(70,211,105,0.6);
+    }
+    video, img {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid #283847;
+      background: #000;
+      min-height: 320px;
+    }
+    .controls {
+      margin-top: 12px;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .controls button,
+    .controls select,
+    .controls input {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #2b3b4c;
+      background: #0f1820;
+      color: var(--text);
+    }
+    .controls button {
+      cursor: pointer;
+      background: linear-gradient(135deg, #1f2b37, #131c24);
+      border-color: #2f4256;
+    }
+    .controls button:hover {
+      border-color: var(--accent);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #0f1a22;
+      border: 1px solid #253446;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .list {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .right h2 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+    }
+    .kpi {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .kpi .card {
+      padding: 12px;
+    }
+    .kpi .value {
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .kpi .label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .note {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 10px;
+    }
+    @media (max-width: 980px) {
+      .shell { grid-template-columns: 1fr; }
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.11"></script>
+</head>
+<body>
+  <div class="shell">
+    <div class="card left">
+      <header>
+        <h1>Live Monitor</h1>
+        <div class="status">
+          <span class="dot" id="statusDot"></span>
+          <span id="statusText">Idle</span>
+        </div>
+      </header>
+      <video id="video" controls autoplay muted playsinline></video>
+      <div class="controls">
+        <input id="urlInput" type="text" value="/hls/stream.m3u8" />
+        <button id="playBtn">Play</button>
+        <button id="stopBtn">Stop</button>
+      </div>
+
+      <div class="list">
+        <div class="pill">Tip: use /hls/stream.m3u8 for browser playback.</div>
+      </div>
+    </div>
+
+    <div class="card right">
+      <h2>System Notes</h2>
+      <div class="list">
+        <div>HLS uses small segments for compatibility and lower latency.</div>
+        <div>RTSP is not supported directly by browsers.</div>
+      </div>
+      <div class="kpi">
+        <div class="card">
+          <div class="value" id="modeValue">HLS</div>
+          <div class="label">Mode</div>
+        </div>
+        <div class="card">
+          <div class="value" id="urlValue">/hls/stream.m3u8</div>
+          <div class="label">Source</div>
+        </div>
+      </div>
+      <div class="note">If video is blank, verify the m3u8 is updating and segments are served.</div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const urlInput = document.getElementById('urlInput');
+    const playBtn = document.getElementById('playBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const modeValue = document.getElementById('modeValue');
+    const urlValue = document.getElementById('urlValue');
+
+    let hls = null;
+
+    function setStatus(ok, text) {
+      statusDot.classList.toggle('ok', ok);
+      statusText.textContent = text;
+    }
+
+    function stopAll() {
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      video.pause();
+      video.removeAttribute('src');
+      video.style.display = 'none';
+      setStatus(false, 'Stopped');
+    }
+
+    function playHls(url) {
+      video.style.display = 'block';
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+        video.play();
+        setStatus(true, 'HLS (native)');
+        return;
+      }
+      if (Hls.isSupported()) {
+        hls = new Hls({
+          lowLatencyMode: true,
+          maxBufferLength: 2,
+          liveSyncDurationCount: 2
+        });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play();
+          setStatus(true, 'HLS (hls.js)');
+        });
+        hls.on(Hls.Events.ERROR, () => {
+          setStatus(false, 'HLS error');
+        });
+      } else {
+        setStatus(false, 'HLS not supported');
+      }
+    }
+
+    playBtn.addEventListener('click', () => {
+      stopAll();
+      const url = urlInput.value.trim();
+      modeValue.textContent = 'HLS';
+      urlValue.textContent = url;
+      playHls(url);
+    });
+
+    stopBtn.addEventListener('click', () => stopAll());
+
+    // Auto start HLS
+    playBtn.click();
+  </script>
+</body>
+</html>
