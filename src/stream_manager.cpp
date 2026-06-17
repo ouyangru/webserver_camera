@@ -278,13 +278,15 @@ void StreamManager::broadcast_mjpeg_packet(const std::shared_ptr<std::vector<uns
         }
     }
 
-    if (enqueued == 0 && frame_count > 3) {
+    if (enqueued == 0 && m_mjpeg_stats.frames > 3) {
         static int warn_count = 0;
         if (++warn_count % 100 == 0) {
-            printf("[MJPEG] WARNING: broadcast frame #%d but enqueued=0, dropped=%zu, clients=%d\n",
-                   frame_count, dropped, (int)clients.size());
+            printf("[MJPEG] WARNING: broadcast frame #%llu but enqueued=0, dropped=%zu, clients=%d\n",
+                   (unsigned long long)m_mjpeg_stats.frames, dropped, (int)clients.size());
         }
     }
+
+    (void)frame_count;  // suppress unused warning if any
 
     lock();
     m_enqueued_packets += enqueued;
@@ -612,7 +614,7 @@ void* mjpeg_stream_thread(void* arg) {
 
         frame_count++;
         if (frame_count <= 3 || frame_count % 100 == 0) {
-            printf("[MJPEG] broadcast frame #%d, seq=%lu, size=%zu, clients=%d\n",
+            printf("[MJPEG] broadcast frame #%d, seq=%lu, size=%zu, clients=%zu\n",
                    frame_count, (unsigned long)last_sequence, len,
                    manager->mjpeg_client_count());
         }
