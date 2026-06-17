@@ -14,7 +14,7 @@
 
 namespace {
 const char* kMjpegBoundary = "frame";
-const size_t kMaxQueueDepthDefault = 5;
+const size_t kMaxQueueDepthDefault = 10;
 const size_t kMaxFlvQueueDepthDefault = 100;
 
 std::string json_escape(const std::string& input) {
@@ -275,6 +275,14 @@ void StreamManager::broadcast_mjpeg_packet(const std::shared_ptr<std::vector<uns
         }
         if (result != http_conn::PACKET_ENQUEUED) {
             ++dropped;
+        }
+    }
+
+    if (enqueued == 0 && frame_count > 3) {
+        static int warn_count = 0;
+        if (++warn_count % 100 == 0) {
+            printf("[MJPEG] WARNING: broadcast frame #%d but enqueued=0, dropped=%zu, clients=%d\n",
+                   frame_count, dropped, (int)clients.size());
         }
     }
 

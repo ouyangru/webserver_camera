@@ -680,12 +680,14 @@ bool http_conn::start_mjpeg_stream() {
     memcpy(packet->data(), header, strlen(header));
 
     m_conn_type = CONN_MJPEG;
-    if (enqueue_packet(packet, 1, false) == PACKET_DROPPED) {
+    // MJPEG 队列深度设为 10：响应头(不可丢弃) + 最多9帧 JPEG
+    // 队列满时丢弃最旧的 JPEG 帧(可丢弃)，保留响应头和最新帧
+    if (enqueue_packet(packet, 10, false) == PACKET_DROPPED) {
         fprintf(stderr, "[MJPEG] start failed: enqueue dropped, fd=%d\n", m_sockfd);
         return false;
     }
     m_stream_manager->add_mjpeg_client(this);
-    printf("[MJPEG] stream started, fd=%d\n", m_sockfd);
+    printf("[MJPEG] stream started, fd=%d, enqueued HTTP header\n", m_sockfd);
     return true;
 }
 
