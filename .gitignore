@@ -1,8 +1,9 @@
-# Local agent instructions
+# Local agent instructions and memory (不同步到远程)
 AGENTS.md
 .agents/
 .codex/
 .codex-git-index*
+.workbuddy/
 
 # Editors and operating systems
 .vscode/
