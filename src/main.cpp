@@ -80,6 +80,19 @@ int main( int argc, char* argv[] ) {
     
     if( argc <= 1 ) {
         printf( "usage: %s port_number [h264_file|v4l2:/dev/videoX]\n", basename(argv[0]));
+        printf( "\n");
+        printf( "  port_number        HTTP server listen port\n");
+        printf( "  h264_file          Local .h264 Annex-B file for HTTP-FLV stream\n");
+        printf( "  v4l2:/dev/videoX   V4L2 H264 encoder device for HTTP-FLV stream\n");
+        printf( "\n");
+        printf( "MJPEG stream (/mjpeg) always uses /dev/video0 for capture.\n");
+        printf( "FLV stream (/live.flv) uses the optional second argument.\n");
+        printf( "On V853: MJPEG capture and H264 encoding are separate /dev/videoX nodes.\n");
+        printf( "\n");
+        printf( "Examples:\n");
+        printf( "  %s 2000                    # MJPEG only (no FLV source)\n", basename(argv[0]));
+        printf( "  %s 2000 test.h264          # MJPEG + FLV from file\n", basename(argv[0]));
+        printf( "  %s 2000 v4l2:/dev/video3   # MJPEG + FLV from H264 encoder\n", basename(argv[0]));
         return 1;
     }
 
@@ -174,7 +187,9 @@ int main( int argc, char* argv[] ) {
     addfd( epollfd, listenfd, false );
     http_conn::m_epollfd = epollfd;
 
-    if (!uses_default_v4l2_device(flv_input_path)) {
+    // MJPEG 采集：固定使用 /dev/video0，采集 MJPEG 帧用于 /mjpeg 流
+    // 与 FLV 源独立：FLV 可以是 .h264 文件或另一个 v4l2 H264 编码器设备
+    {
         pthread_t v4l2_tid;
         pthread_create(&v4l2_tid, NULL, v4l2_thread_func, NULL);
         pthread_detach(v4l2_tid);
@@ -182,16 +197,24 @@ int main( int argc, char* argv[] ) {
         pthread_t mjpeg_tid;
         pthread_create(&mjpeg_tid, NULL, mjpeg_stream_thread, &stream_manager);
         pthread_detach(mjpeg_tid);
-    } else {
-        printf("[V4L2] skip MJPEG capture because HTTP-FLV H264 source uses /dev/video0.\n");
     }
 
+    // FLV 源：可以是 .h264 文件 或 v4l2:/dev/videoX（H264 硬编码器设备）
+    // 如果 FLV 源也是 /dev/video0，V4L2 open 会失败，FLV 降级为不可用
+    // 在 V853 上，MJPEG 采集和 H264 编码通常是不同的 /dev/videoX 节点
     if (flv_input_path) {
+        if (uses_default_v4l2_device(flv_input_path)) {
+            printf("[HTTP-FLV] WARNING: FLV source is /dev/video0, same as MJPEG capture device.\n");
+            printf("[HTTP-FLV]          On V853, use v4l2:/dev/videoX (H264 encoder node) instead.\n");
+            printf("[HTTP-FLV]          Example: %s %d v4l2:/dev/video3\n", basename(argv[0]), port);
+        }
         if (!stream_manager.start_flv_source(flv_input_path, 25)) {
             fprintf(stderr, "[HTTP-FLV] failed to start source: %s\n", flv_input_path);
         }
     } else {
-        printf("[HTTP-FLV] no H264 source configured; /live.flv stays unavailable until /api/start_flv has a configured source.\n");
+        printf("[HTTP-FLV] no H264 source configured; /live.flv stays unavailable.\n");
+        printf("[HTTP-FLV] To enable: %s %d test.h264\n", basename(argv[0]), port);
+        printf("[HTTP-FLV]        or: %s %d v4l2:/dev/videoX\n", basename(argv[0]), port);
     }
 
 #if ENABLE_GSTREAMER

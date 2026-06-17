@@ -372,8 +372,17 @@
     <div class="card">
       <div class="card-title">FLV Source Control</div>
       <div class="api-section">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.5;">
+          MJPEG uses <code style="color:var(--accent)">/dev/video0</code> for capture.<br>
+          FLV needs a separate source:
+          <code style="color:var(--accent)">.h264</code> file or
+          <code style="color:var(--accent)">v4l2:/dev/videoX</code>
+          (H264 encoder device).<br>
+          <span id="flvSourceInfo" style="color:var(--text)"></span>
+        </div>
         <button class="btn-start" id="apiStartBtn" onclick="apiStartFlv()">Start FLV Source</button>
         <button class="btn-stop" id="apiStopBtn" onclick="apiStopFlv()">Stop FLV Source</button>
+        <div id="flvErrorInfo" style="font-size:11px;color:var(--red);margin-top:4px;display:none;"></div>
       </div>
     </div>
 
@@ -671,6 +680,29 @@
       document.getElementById('apiStopBtn').disabled = !flvRunning;
       document.getElementById('flvStartBtn').disabled = flvRunning;
       document.getElementById('flvStopBtn').disabled = !flvRunning;
+
+      // FLV source info
+      const flvSource = flv.source || '';
+      const flvActiveSource = flv.active_source || '';
+      const flvError = flv.last_error || '';
+      const infoEl = document.getElementById('flvSourceInfo');
+      if (flvActiveSource) {
+        infoEl.textContent = 'Active: ' + flvActiveSource;
+        infoEl.style.color = 'var(--green)';
+      } else if (flvSource) {
+        infoEl.textContent = 'Configured: ' + flvSource;
+        infoEl.style.color = 'var(--yellow)';
+      } else {
+        infoEl.innerHTML = 'Not configured. Start with: <code>./my_program 2000 test.h264</code>';
+        infoEl.style.color = 'var(--muted)';
+      }
+      const errEl = document.getElementById('flvErrorInfo');
+      if (flvError && !flvRunning) {
+        errEl.textContent = flvError;
+        errEl.style.display = 'block';
+      } else {
+        errEl.style.display = 'none';
+      }
 
     } catch(e) {
       // silently ignore - server might be down
