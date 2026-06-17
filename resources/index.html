@@ -288,12 +288,12 @@
     </div>
 
     <div class="video-container" id="videoContainer">
-      <!-- MJPEG -->
-      <img id="mjpegView" src="/mjpeg" alt="MJPEG Stream" style="display:block;" onerror="onStreamError('mjpeg')" onload="onStreamOk('mjpeg')">
+      <!-- MJPEG: JS 解析 multipart 流，用 canvas 渲染 -->
+      <canvas id="mjpegCanvas" style="display:block;width:100%;height:100%;background:#000;"></canvas>
       <!-- FLV -->
-      <video id="flvView" controls autoplay muted playsinline style="display:none;"></video>
+      <video id="flvView" controls autoplay muted playsinline style="display:none;width:100%;height:100%;"></video>
       <!-- HLS -->
-      <video id="hlsView" controls autoplay muted playsinline style="display:none;"></video>
+      <video id="hlsView" controls autoplay muted playsinline style="display:none;width:100%;height:100%;"></video>
 
       <div class="video-overlay">
         <span class="tag live-tag" id="liveTag">LIVE</span>
@@ -425,6 +425,202 @@
   let clockInterval = null;
   let startTime = Date.now();
 
+  // ---- MJPEG Viewer (JavaScript 解析 multipart 流，用 canvas 渲染) ----
+  class MjpegViewer {
+    constructor(canvasId) {
+      this.canvas = document.getElementById(canvasId);
+      this.ctx = this.canvas.getContext('2d');
+      this.abortCtrl = null;
+      this.running = false;
+      this.buffer = new Uint8Array(0);
+      this.boundary = null;   // e.g. "--frame\r\n"
+      this.streamOk = false; // 是否已成功解码第一帧
+    }
+
+    async start(url) {
+      if (this.running) return;
+      this.running = true;
+      this.buffer = new Uint8Array(0);
+
+      this.abortCtrl = new AbortController();
+      try {
+        const resp = await fetch(url, { signal: this.abortCtrl.signal });
+        if (!resp.ok) {
+          console.error('[MJPEG] HTTP error:', resp.status, resp.statusText);
+          this.running = false;
+          try { onStreamError('mjpeg'); } catch(e) {}
+          setTimeout(() => {
+            try { onStreamOk('mjpeg'); } catch(e) {}
+            this.start(url);
+          }, 3000);
+          return;
+        }
+        const ct = resp.headers.get('Content-Type') || '';
+        const m = /boundary=(.+)/.exec(ct);
+        if (!m) {
+          console.error('[MJPEG] No boundary in Content-Type:', ct);
+          this.running = false;
+          return;
+        }
+        // 每个 part 以 "--boundary\r\n" 开头
+        this.boundary = new TextEncoder().encode('--' + m[1] + '\r\n');
+        // 调整 canvas 显示尺寸
+        this.canvas.style.display = 'block';
+        this.reader = resp.body.getReader();
+        await this.readLoop(url);
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          console.log('[MJPEG] fetch aborted');
+        } else {
+          console.error('[MJPEG] start error:', e);
+        }
+        this.running = false;
+        if (!this.abortCtrl.signal.aborted) {
+          setTimeout(() => this.start(url), 3000);
+        }
+      }
+    }
+
+    async readLoop(url) {
+      while (this.running) {
+        try {
+          const { done, value } = await this.reader.read();
+          if (done) {
+            console.log('[MJPEG] stream ended');
+            this.running = false;
+            setTimeout(() => this.start(url), 2000);
+            break;
+          }
+          // 追加到 buffer
+          const nb = new Uint8Array(this.buffer.length + value.length);
+          nb.set(this.buffer);
+          nb.set(value, this.buffer.length);
+          this.buffer = nb;
+          this.parseFrames();
+        } catch (e) {
+          if (e.name !== 'AbortError') {
+            console.error('[MJPEG] readLoop error:', e);
+          }
+          this.running = false;
+          break;
+        }
+      }
+    }
+
+    parseFrames() {
+      const b = this.boundary;
+      if (!b) return;
+
+      while (this.running) {
+        if (this.buffer.length < b.length) break;
+
+        // 找到当前 part 的起始边界 "--frame\r\n"
+        let b1 = this.findSubarray(this.buffer, b, 0);
+        if (b1 === -1) {
+          // 保留末尾（避免边界被截断）
+          if (this.buffer.length > b.length) {
+            this.buffer = this.buffer.slice(this.buffer.length - b.length);
+          } else {
+            this.buffer = new Uint8Array(0);
+          }
+          break;
+        }
+
+        // b1 是 "--frame\r\n" 的起点，part header 紧随其后
+        const headerStart = b1 + b.length;
+
+        // 找到 header 结束标记 \r\n\r\n
+        const sep = this.findSubarray(this.buffer, new Uint8Array([0x0D,0x0A,0x0D,0x0A]), headerStart);
+        if (sep === -1) break;  // header 还没收完整
+
+        // 解析 Content-Length
+        const headerBytes = this.buffer.slice(headerStart, sep);
+        const headerText = new TextDecoder('latin1').decode(headerBytes);
+        const lm = /Content-Length:\s*(\d+)/i.exec(headerText);
+        if (!lm) {
+          // 没有 Content-Length，跳到下一个 boundary
+          const nextB = this.findSubarray(this.buffer, b, b1 + 1);
+          if (nextB === -1) break;
+          this.buffer = this.buffer.slice(nextB);
+          continue;
+        }
+
+        const dataLen = parseInt(lm[1]);
+        const dataStart = sep + 4;  // \r\n\r\n 之后是 JPEG 数据
+
+        if (this.buffer.length < dataStart + dataLen + 2) break;  // 数据不够（留2字节给末尾 \r\n）
+
+        // 提取 JPEG 数据
+        const jpegBytes = this.buffer.slice(dataStart, dataStart + dataLen);
+
+        // 用 createImageBitmap 解码并画到 canvas（不阻塞，但按顺序处理）
+        const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+        createImageBitmap(blob).then(bmp => {
+          // 首次成功解码，通知 UI 隐藏占位符
+          if (!this.streamOk) {
+            this.streamOk = true;
+            try { onStreamOk('mjpeg'); } catch(e) {}
+          }
+          // 动态适配 canvas 像素尺寸，避免模糊
+          const containerW = this.canvas.clientWidth;
+          const containerH = this.canvas.clientHeight;
+          if (this.canvas.width !== containerW || this.canvas.height !== containerH) {
+            this.canvas.width = containerW;
+            this.canvas.height = containerH;
+          }
+          // 保持宽高比居中绘制
+          const scale = Math.min(containerW / bmp.width, containerH / bmp.height);
+          const dw = Math.round(bmp.width * scale);
+          const dh = Math.round(bmp.height * scale);
+          const dx = Math.round((containerW - dw) / 2);
+          const dy = Math.round((containerH - dh) / 2);
+          this.ctx.clearRect(0, 0, containerW, containerH);
+          this.ctx.drawImage(bmp, dx, dy, dw, dh);
+        }).catch(e => {
+          // 解码失败，忽略这一帧
+        });
+
+        // 跳过 JPEG 数据 + 末尾 \r\n，定位到下一个 part 的起始
+        let nextPos = dataStart + dataLen;
+        if (nextPos + 2 <= this.buffer.length &&
+            this.buffer[nextPos] === 0x0D && this.buffer[nextPos+1] === 0x0A) {
+          nextPos += 2;  // 跳过 \r\n
+        }
+        this.buffer = this.buffer.slice(nextPos);
+      }
+    }
+
+    findSubarray(haystack, needle, start) {
+      for (let i = start; i <= haystack.length - needle.length; i++) {
+        let ok = true;
+        for (let j = 0; j < needle.length; j++) {
+          if (haystack[i+j] !== needle[j]) { ok = false; break; }
+        }
+        if (ok) return i;
+      }
+      return -1;
+    }
+
+    stop() {
+      this.running = false;
+      if (this.abortCtrl) {
+        try { this.abortCtrl.abort(); } catch(e) {}
+        this.abortCtrl = null;
+      }
+      if (this.reader) {
+        try { this.reader.cancel(); } catch(e) {}
+        this.reader = null;
+      }
+      // 清空 canvas
+      const containerW = this.canvas.clientWidth;
+      const containerH = this.canvas.clientHeight;
+      this.ctx.clearRect(0, 0, containerW, containerH);
+      this.canvas.style.display = 'none';
+    }
+  }
+
+  let mjpegViewer = null;
+
   // ---- Log ----
   function log(msg, type) {
     const box = document.getElementById('logBox');
@@ -455,7 +651,7 @@
     });
 
     // Show/hide views
-    document.getElementById('mjpegView').style.display = tab === 'mjpeg' ? 'block' : 'none';
+    document.getElementById('mjpegCanvas').style.display = tab === 'mjpeg' ? 'block' : 'none';
     document.getElementById('flvView').style.display  = tab === 'flv'    ? 'block' : 'none';
     document.getElementById('hlsView').style.display   = tab === 'hls'    ? 'block' : 'none';
     document.getElementById('placeholder').style.display = 'none';
@@ -464,9 +660,11 @@
 
     // Start player
     if (tab === 'mjpeg') {
-      const img = document.getElementById('mjpegView');
-      img.src = '/mjpeg?' + Date.now();
-      log('Switched to MJPEG stream', 'info');
+      if (!mjpegViewer) {
+        mjpegViewer = new MjpegViewer('mjpegCanvas');
+      }
+      mjpegViewer.start('/mjpeg');
+      log('Switched to MJPEG stream (JS parser)', 'info');
     } else if (tab === 'flv') {
       startFlvPlayer();
       log('Switched to HTTP-FLV stream', 'info');
@@ -477,6 +675,12 @@
   }
 
   function stopCurrentPlayer() {
+    // MJPEG - 停止 JS 解析器
+    if (mjpegViewer) {
+      mjpegViewer.stop();
+      mjpegViewer = null;
+    }
+
     // FLV
     if (flvPlayer) {
       try { flvPlayer.pause(); flvPlayer.unload(); flvPlayer.detachMediaElement(); flvPlayer.destroy(); } catch(e) {}
@@ -487,22 +691,21 @@
       try { hlsPlayer.destroy(); } catch(e) {}
       hlsPlayer = null;
     }
-    // MJPEG
-    document.getElementById('mjpegView').src = '';
   }
 
   // ---- MJPEG callbacks ----
   function onStreamError(src) {
     if (src === 'mjpeg' && currentTab === 'mjpeg') {
       document.getElementById('placeholder').style.display = 'flex';
-      document.getElementById('placeholderMsg').textContent = 'MJPEG stream unavailable - is the camera/V4L2 source running?';
-      document.getElementById('mjpegView').style.display = 'none';
+      document.getElementById('placeholderMsg').textContent = 'MJPEG stream unavailable - is the camera running?';
+      document.getElementById('mjpegCanvas').style.display = 'none';
       log('MJPEG stream error', 'err');
     }
   }
   function onStreamOk(src) {
     if (src === 'mjpeg' && currentTab === 'mjpeg') {
       document.getElementById('placeholder').style.display = 'none';
+      document.getElementById('mjpegCanvas').style.display = 'block';
     }
   }
 
