@@ -18,8 +18,21 @@ const char* error_500_form = "There was an unusual problem serving the requested
 const char* error_503_title = "Service Unavailable";
 const char* error_503_form = "Requested media source is unavailable or not ready.\n";
 
-// 网站的根目录
-const char* doc_root = "/usr/share/webserver_camera/resources";
+// 网站的根目录（可通过 set_doc_root 运行时设置）
+static std::string g_doc_root = "./resources";
+
+// 设置网站根目录（在 main 中通过 /proc/self/exe 自动计算后调用）
+void http_conn::set_doc_root(const std::string& path) {
+    if (!path.empty() && path[path.size() - 1] == '/') {
+        g_doc_root = path.substr(0, path.size() - 1);
+    } else {
+        g_doc_root = path;
+    }
+}
+
+const std::string& http_conn::get_doc_root() {
+    return g_doc_root;
+}
 
 // 设置文件描述符非阻塞
 int setnonblocking( int fd ) {
@@ -469,8 +482,9 @@ http_conn::HTTP_CODE http_conn::do_request()
         return STOP_FLV_REQUEST;
     }
     if(strcmp(m_url,"/live")==0){
-        strncpy(m_real_file, doc_root, FILENAME_LEN - 1);
-        strncat(m_real_file, "/hls/stream.m3u8", FILENAME_LEN - strlen(m_real_file) - 1);
+        std::string path = g_doc_root + "/hls/stream.m3u8";
+        strncpy(m_real_file, path.c_str(), FILENAME_LEN - 1);
+        m_real_file[FILENAME_LEN - 1] = '\0';
         if (stat(m_real_file, &m_file_stat) < 0) {
             return NO_RESOURCE;
         }
@@ -502,10 +516,10 @@ http_conn::HTTP_CODE http_conn::do_request()
         m_url = index_path;
     }
 
-    // "/usr/share/webserver_camera/resources"
-    strcpy( m_real_file, doc_root );
-    int len = strlen( doc_root );
-    strncpy( m_real_file + len, m_url, FILENAME_LEN - len - 1 );
+    // 拼接 doc_root + m_url，doc_root 现在是运行时可配置的相对/绝对路径
+    std::string path = g_doc_root + m_url;
+    strncpy(m_real_file, path.c_str(), FILENAME_LEN - 1);
+    m_real_file[FILENAME_LEN - 1] = '\0';
     // 获取m_real_file文件的相关的状态信息，-1失败，0成功
     if ( stat( m_real_file, &m_file_stat ) < 0 ) {
         return NO_RESOURCE;

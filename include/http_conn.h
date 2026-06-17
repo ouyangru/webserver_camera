@@ -105,6 +105,8 @@ public:
     bool is_streaming() const { return m_conn_type == CONN_MJPEG || m_conn_type == CONN_FLV; }
 
     static void set_stream_manager(StreamManager* manager);
+    static void set_doc_root(const std::string& path);
+    static const std::string& get_doc_root();
 private:
     void init();    // 初始化连接
     HTTP_CODE process_read();    // 解析HTTP请求

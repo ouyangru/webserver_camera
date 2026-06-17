@@ -11,6 +11,7 @@
 #include <new>
 #include <sys/epoll.h>
 #include <sys/stat.h>
+#include <limits.h>
 #include "locker.h"
 #include "threadpool.h"
 #include "http_conn.h"
@@ -46,6 +47,35 @@ bool uses_default_v4l2_device(const char* source) {
            strcmp(source, "v4l2:/dev/video0") == 0;
 }
 
+// 通过 /proc/self/exe 获取可执行文件真实路径，自动推导 resources 目录
+// 规则：可执行文件在 bin/ 下，resources 在 ../resources（相对于可执行文件目录）
+static std::string get_resources_path() {
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, PATH_MAX - 1);
+    if (len == -1) {
+        // fallback：使用当前工作目录下的 resources
+        return "./resources";
+    }
+    exe_path[len] = '\0';
+
+    // 提取可执行文件所在目录（如 /home/user/project/bin）
+    char exe_path_copy[PATH_MAX];
+    strncpy(exe_path_copy, exe_path, PATH_MAX - 1);
+    exe_path_copy[PATH_MAX - 1] = '\0';
+    char* dir = dirname(exe_path_copy);
+
+    // 拼接 ../resources（bin/../resources = project/resources）
+    std::string resources_dir = std::string(dir) + "/../resources";
+
+    // 规范化路径（解析 ../ 等）
+    char resolved[PATH_MAX];
+    if (realpath(resources_dir.c_str(), resolved) == NULL) {
+        // 目录不存在，返回拼接后的原始路径（后续检查会失败并报错）
+        return resources_dir;
+    }
+    return std::string(resolved);
+}
+
 int main( int argc, char* argv[] ) {
     
     if( argc <= 1 ) {
@@ -53,11 +83,14 @@ int main( int argc, char* argv[] ) {
         return 1;
     }
 
+    std::string resources_dir = get_resources_path();
     struct stat st;
-    if (stat("/usr/share/webserver_camera/resources", &st) == -1 || !S_ISDIR(st.st_mode)) {
-        printf("资源目录不存在！请创建：/usr/share/webserver_camera/resources\n");
+    if (stat(resources_dir.c_str(), &st) == -1 || !S_ISDIR(st.st_mode)) {
+        printf("资源目录不存在！请创建：%s\n", resources_dir.c_str());
         return 1;
     }
+    http_conn::set_doc_root(resources_dir);
+    printf("[main] resources dir: %s\n", resources_dir.c_str());
 
     // 获取端口号
     int port = atoi( argv[1] );
@@ -162,6 +195,7 @@ int main( int argc, char* argv[] ) {
     }
 
 #if ENABLE_GSTREAMER
+    set_hls_resources_dir(resources_dir.c_str());
     pthread_t rtsp_tid;
     pthread_create(&rtsp_tid, NULL, rtsp_server_thread, NULL);
     pthread_detach(rtsp_tid);

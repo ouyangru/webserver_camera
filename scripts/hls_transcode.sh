@@ -9,7 +9,7 @@ SOURCE="${1:-http://127.0.0.1:10000/live}"
 WIDTH="${2:-640}"
 HEIGHT="${3:-480}"
 FPS="${4:-25}"
-OUT_DIR="/usr/share/webserver_camera/resources/hls"
+OUT_DIR="${OUT_DIR:-./resources/hls}"
 
 mkdir -p "$OUT_DIR"
 

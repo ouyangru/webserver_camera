@@ -19,9 +19,16 @@
 #define DEFAULT_HEIGHT 480
 #define DEFAULT_FPS 25
 
-const char* kHlsDir = "/usr/share/webserver_camera/resources/hls";
-const char* kHlsPlaylist = "/usr/share/webserver_camera/resources/hls/stream.m3u8";
-const char* kHlsSegment = "/usr/share/webserver_camera/resources/hls/segment%05d.ts";
+// HLS 路径（通过 set_hls_resources_dir() 设置，默认 ./resources/hls）
+static std::string g_hls_dir = "./resources/hls";
+static std::string g_hls_playlist_path = "./resources/hls/stream.m3u8";
+static std::string g_hls_segment_template = "./resources/hls/segment%05d.ts";
+
+void set_hls_resources_dir(const char* resources_dir) {
+    g_hls_dir = std::string(resources_dir) + "/hls";
+    g_hls_playlist_path = g_hls_dir + "/stream.m3u8";
+    g_hls_segment_template = g_hls_dir + "/segment%05d.ts";
+}
 
 namespace {
 GMainLoop* g_loop = NULL;
@@ -55,8 +62,8 @@ const char* select_h264_encoder() {
 }
 
 void ensure_hls_dir() {
-    if (mkdir(kHlsDir, 0755) != 0 && errno != EEXIST) {
-        fprintf(stderr, "[HLS] Failed to create dir: %s\n", kHlsDir);
+    if (mkdir(g_hls_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "[HLS] Failed to create dir: %s\n", g_hls_dir.c_str());
     }
 }
 
@@ -302,7 +309,7 @@ void* hls_streamer_thread(void* arg) {
              "! h264parse config-interval=1 "
              "! mpegtsmux "
              "! hlssink playlist-location=%s location=%s target-duration=2 max-files=5",
-             convert, encoder, kHlsPlaylist, kHlsSegment);
+             convert, encoder, g_hls_playlist_path.c_str(), g_hls_segment_template.c_str());
 
     GError* error = NULL;
     g_hls_pipeline = gst_parse_launch(pipeline_desc, &error);
@@ -364,7 +371,7 @@ void* hls_streamer_thread(void* arg) {
 
     g_hls_loop = g_main_loop_new(NULL, FALSE);
     if (g_hls_loop) {
-        printf("[HLS] Writing playlist at %s\n", kHlsPlaylist);
+        printf("[HLS] Writing playlist at %s\n", g_hls_playlist_path.c_str());
         g_main_loop_run(g_hls_loop);
     }
 
