@@ -1,17 +1,723 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>首页</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebCamera - 视频监控中心</title>
+  <style>
+    :root {
+      --bg: #0a0e14;
+      --bg2: #111922;
+      --panel: #141c26;
+      --panel-border: #1e2d3d;
+      --accent: #3b82f6;
+      --accent-glow: rgba(59,130,246,0.25);
+      --green: #22c55e;
+      --green-glow: rgba(34,197,94,0.3);
+      --red: #ef4444;
+      --red-glow: rgba(239,68,68,0.3);
+      --yellow: #eab308;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --card-radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ---- Top Nav ---- */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 24px;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--panel-border);
+      position: sticky; top: 0; z-index: 100;
+    }
+    .topbar .brand {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 18px; font-weight: 700; letter-spacing: 0.5px;
+    }
+    .topbar .brand svg { width: 28px; height: 28px; }
+    .topbar .meta {
+      display: flex; align-items: center; gap: 16px; font-size: 13px; color: var(--muted);
+    }
+    .dot-indicator {
+      width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+    }
+    .dot-indicator.on  { background: var(--green); box-shadow: 0 0 8px var(--green-glow); }
+    .dot-indicator.off { background: var(--red);   box-shadow: 0 0 8px var(--red-glow); }
+
+    /* ---- Main Layout ---- */
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 16px;
+      padding: 16px 24px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    @media (max-width: 960px) {
+      .main { grid-template-columns: 1fr; }
+    }
+
+    /* ---- Video Area ---- */
+    .video-section {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--card-radius);
+      overflow: hidden;
+      display: flex; flex-direction: column;
+    }
+    .video-tabs {
+      display: flex; border-bottom: 1px solid var(--panel-border);
+    }
+    .video-tabs button {
+      flex: 1; padding: 12px; font-size: 14px; font-weight: 600;
+      background: transparent; border: none; color: var(--muted);
+      cursor: pointer; transition: all 0.2s; position: relative;
+    }
+    .video-tabs button:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+    .video-tabs button.active {
+      color: var(--accent);
+    }
+    .video-tabs button.active::after {
+      content: ''; position: absolute; bottom: 0; left: 20%; right: 20%;
+      height: 2px; background: var(--accent); border-radius: 2px;
+    }
+    .video-tabs button .badge {
+      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+      margin-left: 6px; vertical-align: middle;
+    }
+    .video-tabs button .badge.live { background: var(--red); animation: pulse 1.5s infinite; }
+    .video-tabs button .badge.idle { background: var(--muted); }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    .video-container {
+      position: relative; background: #000;
+      aspect-ratio: 16/9; overflow: hidden;
+    }
+    .video-container video,
+    .video-container img {
+      width: 100%; height: 100%; object-fit: contain; display: block;
+    }
+    .video-overlay {
+      position: absolute; top: 12px; left: 12px;
+      display: flex; gap: 8px; z-index: 10;
+    }
+    .video-overlay .tag {
+      font-size: 11px; font-weight: 700; padding: 3px 10px;
+      border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .tag.live-tag { background: var(--red); color: #fff; }
+    .tag.proto-tag { background: rgba(0,0,0,0.6); color: var(--text); border: 1px solid rgba(255,255,255,0.15); }
+
+    .video-placeholder {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; color: var(--muted);
+      font-size: 15px; gap: 8px;
+    }
+    .video-placeholder svg { width: 48px; height: 48px; opacity: 0.3; }
+
+    .video-controls {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 16px; border-top: 1px solid var(--panel-border);
+    }
+    .video-controls button {
+      padding: 7px 16px; border-radius: 6px; font-size: 13px; font-weight: 500;
+      border: 1px solid var(--panel-border); background: var(--bg2);
+      color: var(--text); cursor: pointer; transition: all 0.15s;
+    }
+    .video-controls button:hover { border-color: var(--accent); }
+    .video-controls button.primary {
+      background: var(--accent); border-color: var(--accent); color: #fff;
+    }
+    .video-controls button.primary:hover { opacity: 0.85; }
+    .video-controls button.danger { border-color: var(--red); color: var(--red); }
+    .video-controls button.danger:hover { background: rgba(239,68,68,0.1); }
+    .video-controls .spacer { flex: 1; }
+    .video-controls .time { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+    /* ---- Right Panel ---- */
+    .right-panel {
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--card-radius);
+      padding: 16px;
+    }
+    .card-title {
+      font-size: 13px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.8px; color: var(--muted); margin-bottom: 12px;
+    }
+
+    /* Status KPI */
+    .kpi-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+    }
+    .kpi-item {
+      background: var(--bg2); border-radius: 8px; padding: 12px;
+      border: 1px solid var(--panel-border);
+    }
+    .kpi-item .value {
+      font-size: 24px; font-weight: 700; line-height: 1.2;
+    }
+    .kpi-item .value.green { color: var(--green); }
+    .kpi-item .value.red   { color: var(--red); }
+    .kpi-item .value.blue  { color: var(--accent); }
+    .kpi-item .value.yellow { color: var(--yellow); }
+    .kpi-item .label {
+      font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* Stream List */
+    .stream-list { display: flex; flex-direction: column; gap: 8px; }
+    .stream-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; background: var(--bg2);
+      border: 1px solid var(--panel-border); border-radius: 8px;
+      font-size: 13px;
+    }
+    .stream-row .dot-indicator { flex-shrink: 0; }
+    .stream-row .name { flex: 1; font-weight: 600; }
+    .stream-row .detail { color: var(--muted); font-size: 12px; }
+
+    /* API Buttons */
+    .api-section { display: flex; flex-direction: column; gap: 8px; }
+    .api-section button {
+      width: 100%; padding: 10px; border-radius: 8px; font-size: 13px; font-weight: 600;
+      border: 1px solid var(--panel-border); cursor: pointer; transition: all 0.15s;
+    }
+    .api-section .btn-start {
+      background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.3); color: var(--green);
+    }
+    .api-section .btn-start:hover { background: rgba(34,197,94,0.2); }
+    .api-section .btn-stop {
+      background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.3); color: var(--red);
+    }
+    .api-section .btn-stop:hover { background: rgba(239,68,68,0.2); }
+    .api-section .btn-start:disabled,
+    .api-section .btn-stop:disabled {
+      opacity: 0.4; cursor: not-allowed;
+    }
+
+    /* Quick Links */
+    .quick-links { display: flex; flex-direction: column; gap: 6px; }
+    .quick-links a {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; border-radius: 8px; font-size: 13px;
+      color: var(--text); text-decoration: none;
+      background: var(--bg2); border: 1px solid var(--panel-border);
+      transition: all 0.15s;
+    }
+    .quick-links a:hover { border-color: var(--accent); color: var(--accent); }
+    .quick-links a .icon { font-size: 16px; opacity: 0.6; }
+
+    /* Log */
+    .log-box {
+      background: var(--bg); border-radius: 8px; padding: 10px 12px;
+      max-height: 160px; overflow-y: auto; font-family: "Cascadia Code", "Fira Code", monospace;
+      font-size: 11px; line-height: 1.6; color: var(--muted);
+      border: 1px solid var(--panel-border);
+    }
+    .log-box .log-ok { color: var(--green); }
+    .log-box .log-err { color: var(--red); }
+    .log-box .log-info { color: var(--accent); }
+
+    /* Toast */
+    .toast-container {
+      position: fixed; top: 60px; right: 24px; z-index: 999;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .toast {
+      padding: 10px 16px; border-radius: 8px; font-size: 13px; font-weight: 500;
+      animation: toastIn 0.3s ease-out;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .toast.success { background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.3); color: var(--green); }
+    .toast.error   { background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: var(--red); }
+    .toast.info    { background: rgba(59,130,246,0.15); border: 1px solid rgba(59,130,246,0.3); color: var(--accent); }
+    @keyframes toastIn { from { opacity:0; transform:translateX(30px); } to { opacity:1; transform:translateX(0); } }
+
+    /* Fullscreen */
+    .video-container:fullscreen { background: #000; }
+    .video-container:-webkit-full-screen { background: #000; }
+  </style>
 </head>
 <body>
 
-    <h1>欢迎来到首页~~~</h1> </br>
-    <img src="images/image1.jpg"  alt="ces" />
-    <p><a href="/hls/index.html">HLS Live Player</a></p>
-    <p><a href="/monitor.html">Monitor UI</a></p>
-    
+<!-- Top Bar -->
+<div class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/>
+      <rect x="2" y="6" width="14" height="12" rx="2"/>
+    </svg>
+    WebCamera Monitor
+  </div>
+  <div class="meta">
+    <span id="uptimeDisplay">Uptime: --</span>
+    <span class="dot-indicator on"></span>
+    <span id="topClients">0 clients</span>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Video Area -->
+  <div class="video-section">
+    <div class="video-tabs">
+      <button class="active" data-tab="mjpeg" onclick="switchTab('mjpeg')">
+        MJPEG <span class="badge live" id="badge-mjpeg"></span>
+      </button>
+      <button data-tab="flv" onclick="switchTab('flv')">
+        HTTP-FLV <span class="badge idle" id="badge-flv"></span>
+      </button>
+      <button data-tab="hls" onclick="switchTab('hls')">
+        HLS <span class="badge idle" id="badge-hls"></span>
+      </button>
+    </div>
+
+    <div class="video-container" id="videoContainer">
+      <!-- MJPEG -->
+      <img id="mjpegView" src="/mjpeg" alt="MJPEG Stream" style="display:block;" onerror="onStreamError('mjpeg')" onload="onStreamOk('mjpeg')">
+      <!-- FLV -->
+      <video id="flvView" controls autoplay muted playsinline style="display:none;"></video>
+      <!-- HLS -->
+      <video id="hlsView" controls autoplay muted playsinline style="display:none;"></video>
+
+      <div class="video-overlay">
+        <span class="tag live-tag" id="liveTag">LIVE</span>
+        <span class="tag proto-tag" id="protoTag">MJPEG</span>
+      </div>
+
+      <div class="video-placeholder" id="placeholder" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/>
+          <rect x="2" y="6" width="14" height="12" rx="2"/>
+          <line x1="2" y1="2" x2="22" y2="22"/>
+        </svg>
+        <span id="placeholderMsg">Stream unavailable</span>
+      </div>
+    </div>
+
+    <div class="video-controls">
+      <button class="primary" onclick="reconnect()">Reconnect</button>
+      <button onclick="toggleFullscreen()">Fullscreen</button>
+      <button id="flvStartBtn" onclick="apiStartFlv()">Start FLV</button>
+      <button id="flvStopBtn" class="danger" onclick="apiStopFlv()">Stop FLV</button>
+      <span class="spacer"></span>
+      <span class="time" id="clockDisplay">--:--:--</span>
+    </div>
+  </div>
+
+  <!-- Right Panel -->
+  <div class="right-panel">
+
+    <!-- KPI -->
+    <div class="card">
+      <div class="card-title">Server Status</div>
+      <div class="kpi-grid">
+        <div class="kpi-item">
+          <div class="value blue" id="kpiClients">0</div>
+          <div class="label">HTTP Clients</div>
+        </div>
+        <div class="kpi-item">
+          <div class="value green" id="kpiMjpeg">OFF</div>
+          <div class="label">MJPEG Source</div>
+        </div>
+        <div class="kpi-item">
+          <div class="value" id="kpiFlv" style="color:var(--muted)">OFF</div>
+          <div class="label">FLV Source</div>
+        </div>
+        <div class="kpi-item">
+          <div class="value yellow" id="kpiFlvClients">0</div>
+          <div class="label">FLV Viewers</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stream List -->
+    <div class="card">
+      <div class="card-title">Available Streams</div>
+      <div class="stream-list">
+        <div class="stream-row">
+          <span class="dot-indicator" id="dot-mjpeg"></span>
+          <span class="name">MJPEG</span>
+          <span class="detail">/mjpeg</span>
+        </div>
+        <div class="stream-row">
+          <span class="dot-indicator" id="dot-flv"></span>
+          <span class="name">HTTP-FLV</span>
+          <span class="detail">/live.flv</span>
+        </div>
+        <div class="stream-row">
+          <span class="dot-indicator" id="dot-hls"></span>
+          <span class="name">HLS</span>
+          <span class="detail">/live</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- API Control -->
+    <div class="card">
+      <div class="card-title">FLV Source Control</div>
+      <div class="api-section">
+        <button class="btn-start" id="apiStartBtn" onclick="apiStartFlv()">Start FLV Source</button>
+        <button class="btn-stop" id="apiStopBtn" onclick="apiStopFlv()">Stop FLV Source</button>
+      </div>
+    </div>
+
+    <!-- Quick Links -->
+    <div class="card">
+      <div class="card-title">Quick Links</div>
+      <div class="quick-links">
+        <a href="/mjpeg" target="_blank"><span class="icon">&#9679;</span> Raw MJPEG Stream</a>
+        <a href="/live.flv" target="_blank"><span class="icon">&#9654;</span> FLV Stream (need player)</a>
+        <a href="/live" target="_blank"><span class="icon">&#9654;</span> HLS Playlist</a>
+        <a href="/api/status" target="_blank"><span class="icon">{ }</span> Status JSON</a>
+        <a href="/monitor.html"><span class="icon">&#9881;</span> Legacy Monitor</a>
+        <a href="/hls/index.html"><span class="icon">&#9654;</span> HLS Player Page</a>
+      </div>
+    </div>
+
+    <!-- Log -->
+    <div class="card">
+      <div class="card-title">Event Log</div>
+      <div class="log-box" id="logBox"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- flv.js -->
+<script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+<!-- hls.js -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.11/dist/hls.min.js"></script>
+
+<script>
+  // ---- State ----
+  let currentTab = 'mjpeg';
+  let flvPlayer = null;
+  let hlsPlayer = null;
+  let statusInterval = null;
+  let clockInterval = null;
+  let startTime = Date.now();
+
+  // ---- Log ----
+  function log(msg, type) {
+    const box = document.getElementById('logBox');
+    const ts = new Date().toLocaleTimeString();
+    const cls = type === 'ok' ? 'log-ok' : type === 'err' ? 'log-err' : type === 'info' ? 'log-info' : '';
+    box.innerHTML += '<div class="' + cls + '">[' + ts + '] ' + msg + '</div>';
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // ---- Toast ----
+  function toast(msg, type) {
+    const c = document.getElementById('toastContainer');
+    const d = document.createElement('div');
+    d.className = 'toast ' + (type || 'info');
+    d.textContent = msg;
+    c.appendChild(d);
+    setTimeout(() => d.remove(), 3500);
+  }
+
+  // ---- Tab Switch ----
+  function switchTab(tab) {
+    stopCurrentPlayer();
+    currentTab = tab;
+
+    // Update tab buttons
+    document.querySelectorAll('.video-tabs button').forEach(b => {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    });
+
+    // Show/hide views
+    document.getElementById('mjpegView').style.display = tab === 'mjpeg' ? 'block' : 'none';
+    document.getElementById('flvView').style.display  = tab === 'flv'    ? 'block' : 'none';
+    document.getElementById('hlsView').style.display   = tab === 'hls'    ? 'block' : 'none';
+    document.getElementById('placeholder').style.display = 'none';
+    document.getElementById('liveTag').textContent = 'LIVE';
+    document.getElementById('protoTag').textContent = tab.toUpperCase();
+
+    // Start player
+    if (tab === 'mjpeg') {
+      const img = document.getElementById('mjpegView');
+      img.src = '/mjpeg?' + Date.now();
+      log('Switched to MJPEG stream', 'info');
+    } else if (tab === 'flv') {
+      startFlvPlayer();
+      log('Switched to HTTP-FLV stream', 'info');
+    } else if (tab === 'hls') {
+      startHlsPlayer();
+      log('Switched to HLS stream', 'info');
+    }
+  }
+
+  function stopCurrentPlayer() {
+    // FLV
+    if (flvPlayer) {
+      try { flvPlayer.pause(); flvPlayer.unload(); flvPlayer.detachMediaElement(); flvPlayer.destroy(); } catch(e) {}
+      flvPlayer = null;
+    }
+    // HLS
+    if (hlsPlayer) {
+      try { hlsPlayer.destroy(); } catch(e) {}
+      hlsPlayer = null;
+    }
+    // MJPEG
+    document.getElementById('mjpegView').src = '';
+  }
+
+  // ---- MJPEG callbacks ----
+  function onStreamError(src) {
+    if (src === 'mjpeg' && currentTab === 'mjpeg') {
+      document.getElementById('placeholder').style.display = 'flex';
+      document.getElementById('placeholderMsg').textContent = 'MJPEG stream unavailable - is the camera/V4L2 source running?';
+      document.getElementById('mjpegView').style.display = 'none';
+      log('MJPEG stream error', 'err');
+    }
+  }
+  function onStreamOk(src) {
+    if (src === 'mjpeg' && currentTab === 'mjpeg') {
+      document.getElementById('placeholder').style.display = 'none';
+    }
+  }
+
+  // ---- FLV Player ----
+  function startFlvPlayer() {
+    if (!flvjs || !flvjs.isSupported()) {
+      showPlaceholder('Your browser does not support FLV playback (flv.js).');
+      log('flv.js not supported in this browser', 'err');
+      return;
+    }
+    const video = document.getElementById('flvView');
+    flvPlayer = flvjs.createPlayer({
+      type: 'flv', url: '/live.flv', isLive: true,
+      hasAudio: false, hasVideo: true,
+    }, {
+      enableStashBuffer: false,
+      stashInitialSize: 128,
+      autoCleanupSourceBuffer: true,
+    });
+    flvPlayer.attachMediaElement(video);
+    flvPlayer.load();
+    flvPlayer.play().catch(() => {});
+    flvPlayer.on(flvjs.Events.ERROR, (e) => {
+      log('FLV player error: ' + e, 'err');
+      toast('FLV stream error', 'error');
+    });
+    flvPlayer.on(flvjs.Events.LOADING_COMPLETE, () => {
+      log('FLV loading complete', 'info');
+    });
+    log('FLV player started', 'ok');
+  }
+
+  // ---- HLS Player ----
+  function startHlsPlayer() {
+    const video = document.getElementById('hlsView');
+    const src = '/hls/stream.m3u8';
+
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = src;
+      video.play().catch(() => {});
+      log('HLS native playback started', 'ok');
+      return;
+    }
+    if (!Hls || !Hls.isSupported()) {
+      showPlaceholder('Your browser does not support HLS playback.');
+      log('hls.js not supported', 'err');
+      return;
+    }
+    hlsPlayer = new Hls({
+      lowLatencyMode: true,
+      maxBufferLength: 2,
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 5,
+    });
+    hlsPlayer.loadSource(src);
+    hlsPlayer.attachMedia(video);
+    hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {});
+      log('HLS playback started', 'ok');
+    });
+    hlsPlayer.on(Hls.Events.ERROR, (event, data) => {
+      if (data.fatal) {
+        log('HLS fatal error: ' + data.type, 'err');
+        toast('HLS stream error', 'error');
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          hlsPlayer.startLoad();
+        }
+      }
+    });
+  }
+
+  function showPlaceholder(msg) {
+    document.getElementById('placeholder').style.display = 'flex';
+    document.getElementById('placeholderMsg').textContent = msg;
+  }
+
+  // ---- Reconnect ----
+  function reconnect() {
+    log('Reconnecting ' + currentTab + '...', 'info');
+    toast('Reconnecting...', 'info');
+    switchTab(currentTab);
+  }
+
+  // ---- Fullscreen ----
+  function toggleFullscreen() {
+    const el = document.getElementById('videoContainer');
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      el.requestFullscreen().catch(() => {});
+    }
+  }
+
+  // ---- API: Start/Stop FLV ----
+  async function apiStartFlv() {
+    log('Requesting FLV source start...', 'info');
+    try {
+      const r = await fetch('/api/start_flv');
+      const d = await r.json();
+      if (d.ok) {
+        toast('FLV source started', 'success');
+        log('FLV source started', 'ok');
+      } else {
+        toast('Failed to start FLV: ' + (d.error || 'unknown'), 'error');
+        log('FLV start failed: ' + (d.error || 'unknown'), 'err');
+      }
+    } catch(e) {
+      toast('API request failed', 'error');
+      log('API /api/start_flv error: ' + e.message, 'err');
+    }
+    fetchStatus();
+  }
+
+  async function apiStopFlv() {
+    log('Requesting FLV source stop...', 'info');
+    try {
+      const r = await fetch('/api/stop_flv');
+      const d = await r.json();
+      if (d.ok) {
+        toast('FLV source stopped', 'success');
+        log('FLV source stopped', 'ok');
+      } else {
+        toast('Failed to stop FLV', 'error');
+        log('FLV stop failed', 'err');
+      }
+    } catch(e) {
+      toast('API request failed', 'error');
+      log('API /api/stop_flv error: ' + e.message, 'err');
+    }
+    fetchStatus();
+  }
+
+  // ---- Status Polling ----
+  async function fetchStatus() {
+    try {
+      const r = await fetch('/api/status');
+      const d = await r.json();
+
+      // KPI
+      const clients = d.http_clients || 0;
+      document.getElementById('kpiClients').textContent = clients;
+      document.getElementById('topClients').textContent = clients + ' client' + (clients !== 1 ? 's' : '');
+
+      // Streams
+      const streams = d.streams || {};
+      const mjpeg = streams.mjpeg || {};
+      const flv = streams.flv || {};
+
+      // MJPEG
+      const mjpegReady = mjpeg.source_ready || false;
+      const mjpegEl = document.getElementById('kpiMjpeg');
+      mjpegEl.textContent = mjpegReady ? 'ON' : 'OFF';
+      mjpegEl.className = 'value ' + (mjpegReady ? 'green' : '');
+      setDot('dot-mjpeg', mjpegReady);
+      setBadge('badge-mjpeg', mjpegReady);
+
+      // FLV
+      const flvRunning = flv.source_running || false;
+      const flvReady = flv.source_ready || false;
+      const flvClients = flv.clients || 0;
+      const flvEl = document.getElementById('kpiFlv');
+      flvEl.textContent = flvRunning ? 'ON' : 'OFF';
+      flvEl.className = 'value ' + (flvRunning ? 'green' : '');
+      document.getElementById('kpiFlvClients').textContent = flvClients;
+      setDot('dot-flv', flvReady);
+      setBadge('badge-flv', flvReady);
+
+      // HLS - infer from FLV since HLS needs GStreamer
+      const hlsReady = flvRunning; // approximate
+      setDot('dot-hls', hlsReady);
+      setBadge('badge-hls', hlsReady);
+
+      // API buttons
+      document.getElementById('apiStartBtn').disabled = flvRunning;
+      document.getElementById('apiStopBtn').disabled = !flvRunning;
+      document.getElementById('flvStartBtn').disabled = flvRunning;
+      document.getElementById('flvStopBtn').disabled = !flvRunning;
+
+    } catch(e) {
+      // silently ignore - server might be down
+    }
+  }
+
+  function setDot(id, on) {
+    const el = document.getElementById(id);
+    if (el) { el.className = 'dot-indicator ' + (on ? 'on' : 'off'); }
+  }
+  function setBadge(id, on) {
+    const el = document.getElementById(id);
+    if (el) { el.className = 'badge ' + (on ? 'live' : 'idle'); }
+  }
+
+  // ---- Clock & Uptime ----
+  function updateClock() {
+    const now = new Date();
+    document.getElementById('clockDisplay').textContent = now.toLocaleTimeString();
+
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const h = Math.floor(elapsed / 3600);
+    const m = Math.floor((elapsed % 3600) / 60);
+    const s = elapsed % 60;
+    document.getElementById('uptimeDisplay').textContent =
+      'Uptime: ' + (h > 0 ? h + 'h ' : '') + m + 'm ' + s + 's';
+  }
+
+  // ---- Init ----
+  function init() {
+    log('Dashboard initialized', 'ok');
+    log('Connecting to MJPEG stream...', 'info');
+
+    // Start status polling every 2s
+    fetchStatus();
+    statusInterval = setInterval(fetchStatus, 2000);
+
+    // Clock
+    updateClock();
+    clockInterval = setInterval(updateClock, 1000);
+    startTime = Date.now();
+
+    // Default tab
+    switchTab('mjpeg');
+  }
+
+  init();
+</script>
 </body>
 </html>
