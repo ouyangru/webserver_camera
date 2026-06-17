@@ -565,7 +565,9 @@ void* mjpeg_stream_thread(void* arg) {
         return NULL;
     }
 
+    printf("[MJPEG] broadcast thread started\n");
     uint64_t last_sequence = 0;
+    int frame_count = 0;
     while (true) {
         pthread_mutex_lock(&g_frame.lock);
         while (g_frame.sequence == last_sequence) {
@@ -600,6 +602,12 @@ void* mjpeg_stream_thread(void* arg) {
         memcpy(packet->data() + header_len + len, "\r\n", 2);
         pthread_mutex_unlock(&g_frame.lock);
 
+        frame_count++;
+        if (frame_count <= 3 || frame_count % 100 == 0) {
+            printf("[MJPEG] broadcast frame #%d, seq=%lu, size=%zu, clients=%d\n",
+                   frame_count, (unsigned long)last_sequence, len,
+                   manager->mjpeg_client_count());
+        }
         manager->broadcast_mjpeg_packet(packet);
     }
 

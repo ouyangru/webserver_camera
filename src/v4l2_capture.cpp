@@ -52,7 +52,7 @@ void* v4l2_thread_func(void* arg) {
         fprintf(stderr, "[V4L2] Capture disabled; HTTP service will continue running.\n");
         return NULL;
     }
-    printf("[V4L2] 摄像头设备 %s 已打开，等待客户端连接...\n", VIDEO_DEV);
+    printf("[V4L2] 摄像头设备 %s 已打开，开始实时采集...\n", VIDEO_DEV);
     print_supported_formats(fd);
 
     // 设置输出为 MJPEG 优先，失败后回退 NV12/YUYV
@@ -76,6 +76,13 @@ void* v4l2_thread_func(void* arg) {
     pthread_mutex_lock(&g_frame.lock);
     g_frame.pixel_format = fmt.fmt.pix.pixelformat;
     pthread_mutex_unlock(&g_frame.lock);
+
+    {
+        char fourcc[5];
+        fourcc_to_string(fmt.fmt.pix.pixelformat, fourcc);
+        printf("[V4L2] Actual format: %s, resolution: %dx%d\n",
+               fourcc, fmt.fmt.pix.width, fmt.fmt.pix.height);
+    }
 
     // 申请并映射缓冲区
     struct v4l2_requestbuffers req;
@@ -112,31 +119,14 @@ void* v4l2_thread_func(void* arg) {
     }
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    int streaming_on = 0;
-
-    const int width = fmt.fmt.pix.width;
-    const int height = fmt.fmt.pix.height;
-    (void)width;
-    (void)height;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        perror("VIDIOC_STREAMON");
+        close(fd);
+        return NULL;
+    }
+    printf("[V4L2] Stream ON - 开始实时采集\n");
 
     while (1) {
-        pthread_mutex_lock(&g_frame.lock);
-        while (g_frame.client_count == 0) {
-            if (streaming_on) {
-                ioctl(fd, VIDIOC_STREAMOFF, &type);
-                streaming_on = 0;
-                printf("[V4L2] Stream OFF - 进入节能模式\n");
-            }
-            pthread_cond_wait(&g_frame.cond_start_cap, &g_frame.lock);
-        }
-
-        if (!streaming_on) {
-            ioctl(fd, VIDIOC_STREAMON, &type);
-            streaming_on = 1;
-            printf("[V4L2] Stream ON - 开始实时采集\n");
-        }
-        pthread_mutex_unlock(&g_frame.lock);
-
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -147,11 +137,17 @@ void* v4l2_thread_func(void* arg) {
                 memcpy(g_frame.data, buffers[buf.index].start, buf.bytesused);
                 g_frame.length = buf.bytesused;
                 g_frame.sequence++;
+                if (g_frame.sequence <= 3) {
+                    printf("[V4L2] captured frame #%lu, bytes=%d\n",
+                           (unsigned long)g_frame.sequence, buf.bytesused);
+                }
                 pthread_cond_broadcast(&g_frame.cond_new_frame);
             }
             pthread_mutex_unlock(&g_frame.lock);
 
             ioctl(fd, VIDIOC_QBUF, &buf);
+        } else {
+            perror("[V4L2] VIDIOC_DQBUF");
         }
     }
 

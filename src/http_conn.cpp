@@ -279,7 +279,7 @@ http_conn::PacketQueueResult http_conn::enqueue_flv_packet(
 void http_conn::notify_write() {
     pthread_mutex_lock(&m_send_lock);
     if (m_sockfd != -1) {
-        modfd(m_epollfd, m_sockfd, EPOLLOUT);
+        modfd(m_epollfd, m_sockfd, EPOLLIN | EPOLLOUT | EPOLLRDHUP);
     }
     pthread_mutex_unlock(&m_send_lock);
 }
@@ -573,7 +573,7 @@ bool http_conn::write_stream() {
         }
 
         if (m_send_queue.empty()) {
-            modfd(m_epollfd, m_sockfd, EPOLLIN);
+            modfd(m_epollfd, m_sockfd, EPOLLIN | EPOLLRDHUP);
             pthread_mutex_unlock(&m_send_lock);
             return true;
         }
@@ -604,7 +604,7 @@ bool http_conn::write_stream() {
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                modfd(m_epollfd, m_sockfd, EPOLLOUT);
+                modfd(m_epollfd, m_sockfd, EPOLLIN | EPOLLOUT | EPOLLRDHUP);
                 pthread_mutex_unlock(&m_send_lock);
                 return true;
             }
@@ -624,6 +624,7 @@ bool http_conn::write_stream() {
         }
         pthread_mutex_unlock(&m_send_lock);
     }
+    return true;  // while(true) 内所有退出路径都有 return，此处仅为消除编译器警告
 }
 
 bool http_conn::build_status_response() {
@@ -663,6 +664,7 @@ bool http_conn::build_json_response(const std::string& body) {
 
 bool http_conn::start_mjpeg_stream() {
     if (!m_stream_manager) {
+        fprintf(stderr, "[MJPEG] start failed: no stream_manager, fd=%d\n", m_sockfd);
         return false;
     }
 
@@ -679,9 +681,11 @@ bool http_conn::start_mjpeg_stream() {
 
     m_conn_type = CONN_MJPEG;
     if (enqueue_packet(packet, 1, false) == PACKET_DROPPED) {
+        fprintf(stderr, "[MJPEG] start failed: enqueue dropped, fd=%d\n", m_sockfd);
         return false;
     }
     m_stream_manager->add_mjpeg_client(this);
+    printf("[MJPEG] stream started, fd=%d\n", m_sockfd);
     return true;
 }
 
