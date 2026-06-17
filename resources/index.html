@@ -528,7 +528,7 @@
 
         // 3. 解析 Content-Length
         const hdrText = text.substring(hdrStart, hdrEnd);
-        const clMatch = /Content-Length:/s*(/d+)/i.exec(hdrText);
+        const clMatch = /Content-Length:\s*(\d+)/i.exec(hdrText);
         if (!clMatch) {
           console.warn('[MJPEG] no Content-Length in header, skipping');
           searchPos = bIdx + 1;
