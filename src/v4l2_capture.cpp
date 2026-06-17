@@ -20,10 +20,40 @@ struct v4l2_buf_unit {
     size_t length;
 };
 
+static void fourcc_to_string(uint32_t fmt, char out[5]) {
+    out[0] = static_cast<char>(fmt & 0xFF);
+    out[1] = static_cast<char>((fmt >> 8) & 0xFF);
+    out[2] = static_cast<char>((fmt >> 16) & 0xFF);
+    out[3] = static_cast<char>((fmt >> 24) & 0xFF);
+    out[4] = '\0';
+}
+
+static void print_supported_formats(int fd) {
+    printf("[V4L2] Supported capture formats:\n");
+    for (uint32_t index = 0;; ++index) {
+        struct v4l2_fmtdesc desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.index = index;
+        desc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_ENUM_FMT, &desc) < 0) {
+            break;
+        }
+
+        char fourcc[5];
+        fourcc_to_string(desc.pixelformat, fourcc);
+        printf("[V4L2]   %s - %s\n", fourcc, desc.description);
+    }
+}
+
 void* v4l2_thread_func(void* arg) {
     int fd = open(VIDEO_DEV, O_RDWR);
-    if (fd < 0) { perror("V4L2 Open"); exit(1); }
+    if (fd < 0) {
+        perror("V4L2 Open");
+        fprintf(stderr, "[V4L2] Capture disabled; HTTP service will continue running.\n");
+        return NULL;
+    }
     printf("[V4L2] 摄像头设备 %s 已打开，等待客户端连接...\n", VIDEO_DEV);
+    print_supported_formats(fd);
 
     // 设置输出为 MJPEG 优先，失败后回退 NV12/YUYV
     struct v4l2_format fmt;
@@ -116,6 +146,7 @@ void* v4l2_thread_func(void* arg) {
             if (buf.bytesused <= MAX_FRAME_SIZE) {
                 memcpy(g_frame.data, buffers[buf.index].start, buf.bytesused);
                 g_frame.length = buf.bytesused;
+                g_frame.sequence++;
                 pthread_cond_broadcast(&g_frame.cond_new_frame);
             }
             pthread_mutex_unlock(&g_frame.lock);

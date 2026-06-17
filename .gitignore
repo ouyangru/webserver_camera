@@ -1,0 +1,41 @@
+# Local agent instructions
+AGENTS.md
+.agents/
+.codex/
+.codex-git-index*
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build directories and compiled files
+bin/
+obj/
+build/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# Generated media and local test inputs
+*.h264
+*.flv
+*.m3u8
+*.ts
+resources/images/
+
+# Generated webbench files
+test_presure/**/webbench
+test_presure/**/*.o
+test_presure/**/tags
+
+# Runtime output
+*.log
+core
+core.*

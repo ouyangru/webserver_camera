@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define MAX_FRAME_SIZE (2 * 1024 * 1024)
 
@@ -15,6 +16,7 @@ typedef struct {
     unsigned char data[MAX_FRAME_SIZE];
     size_t length;
     int pixel_format;
+    uint64_t sequence;            // 每采集到一帧递增，用于识别真正的新帧
     int client_count;             // 在线客户端计数
     pthread_mutex_t lock;         // 互斥锁
     pthread_cond_t cond_new_frame; // 新帧到达通知

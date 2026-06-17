@@ -18,11 +18,13 @@
 #include <sys/mman.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <string>
 #include <vector>
 #include "locker.h"
+#include "media_types.h"
 #include <sys/uio.h>
 
 class StreamManager;
@@ -57,7 +59,22 @@ public:
         INTERNAL_ERROR      :   表示服务器内部错误
         CLOSED_CONNECTION   :   表示客户端已经关闭连接了
     */
-    enum HTTP_CODE { NO_REQUEST, GET_REQUEST, BAD_REQUEST, NO_RESOURCE, FORBIDDEN_REQUEST, FILE_REQUEST, INTERNAL_ERROR, CLOSED_CONNECTION, MJPEG_REQUEST, STATUS_REQUEST };
+    enum HTTP_CODE {
+        NO_REQUEST,
+        GET_REQUEST,
+        BAD_REQUEST,
+        NO_RESOURCE,
+        FORBIDDEN_REQUEST,
+        FILE_REQUEST,
+        INTERNAL_ERROR,
+        CLOSED_CONNECTION,
+        MJPEG_REQUEST,
+        FLV_REQUEST,
+        STATUS_REQUEST,
+        START_FLV_REQUEST,
+        STOP_FLV_REQUEST,
+        SERVICE_UNAVAILABLE
+    };
     
     // 从状态机的三种可能状态，即行的读取状态，分别表示
     // 1.读取到一个完整的行 2.行出错 3.行数据尚且不完整
@@ -71,18 +88,32 @@ public:
     void process(); // 处理客户端请求
     bool read();// 非阻塞读
     bool write();// 非阻塞写
-    bool enqueue_packet(const std::shared_ptr<std::vector<unsigned char>>& packet, size_t max_queue_depth);
+    enum PacketQueueResult {
+        PACKET_ENQUEUED,
+        PACKET_ENQUEUED_AFTER_DROP,
+        PACKET_DROPPED
+    };
+
+    PacketQueueResult enqueue_packet(
+        const std::shared_ptr<std::vector<unsigned char>>& packet,
+        size_t max_queue_depth,
+        bool droppable = true);
+    PacketQueueResult enqueue_flv_packet(const std::shared_ptr<Packet>& packet);
     void notify_write();
     bool is_mjpeg() const { return m_conn_type == CONN_MJPEG; }
+    bool is_flv() const { return m_conn_type == CONN_FLV; }
+    bool is_streaming() const { return m_conn_type == CONN_MJPEG || m_conn_type == CONN_FLV; }
 
     static void set_stream_manager(StreamManager* manager);
 private:
     void init();    // 初始化连接
     HTTP_CODE process_read();    // 解析HTTP请求
     bool process_write( HTTP_CODE ret );    // 填充HTTP应答
-    bool write_mjpeg();
+    bool write_stream();
     bool build_status_response();
+    bool build_json_response(const std::string& body);
     bool start_mjpeg_stream();
+    bool start_flv_stream();
 
     // 下面这一组函数被process_read调用以分析HTTP请求
     HTTP_CODE parse_request_line( char* text );  // 解析HTTP请求首行
@@ -105,12 +136,21 @@ private:
 
 public:
     static int m_epollfd;       // 所有socket上的事件都被注册到同一个epoll内核事件中，所以设置成静态的
-    static int m_user_count;    // 统计用户的数量
+    static std::atomic<int> m_user_count; // 统计用户数量，主线程和工作线程都会访问
     static StreamManager* m_stream_manager;
 
-    enum ConnType { CONN_HTTP = 0, CONN_MJPEG };
+    enum ConnType { CONN_HTTP = 0, CONN_MJPEG, CONN_FLV };
 
 private:
+    struct QueuedPacket {
+        std::shared_ptr<std::vector<unsigned char>> data;
+        bool droppable;
+
+        QueuedPacket(const std::shared_ptr<std::vector<unsigned char>>& packet,
+                     bool can_drop)
+            : data(packet), droppable(can_drop) {}
+    };
+
     int m_sockfd;           // 该HTTP连接的socket和对方的socket地址
     sockaddr_in m_address;
     
@@ -135,10 +175,13 @@ private:
     struct stat m_file_stat;                // 目标文件的状态。通过它我们可以判断文件是否存在、是否为目录、是否可读，并获取文件大小等信息
     struct iovec m_iv[2];                   // 我们将采用writev来执行写操作，所以定义下面两个成员，其中m_iv_count表示被写内存块的数量。
     int m_iv_count;
+    size_t m_bytes_to_send;                 // 当前响应还剩多少字节没有发送
+    size_t m_bytes_have_sent;               // 当前响应已经发送了多少字节
 
     ConnType m_conn_type;
-    std::deque<std::shared_ptr<std::vector<unsigned char>>> m_send_queue;
+    std::deque<QueuedPacket> m_send_queue;
     size_t m_send_offset;
+    bool m_wait_flv_key_frame;
     pthread_mutex_t m_send_lock;
 };
 
