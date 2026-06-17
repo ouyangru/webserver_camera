@@ -426,21 +426,41 @@
   let startTime = Date.now();
 
   // ---- MJPEG Viewer (JavaScript 解析 multipart 流，用 canvas 渲染) ----
+  // 使用状态机逐字节解析，避免二进制数据误匹配 boundary
   class MjpegViewer {
     constructor(canvasId) {
       this.canvas = document.getElementById(canvasId);
       this.ctx = this.canvas.getContext('2d');
       this.abortCtrl = null;
       this.running = false;
-      this.buffer = new Uint8Array(0);
-      this.boundary = null;   // e.g. "--frame\r\n"
-      this.streamOk = false; // 是否已成功解码第一帧
+      this.streamOk = false;
+
+      // 状态机状态
+      this.STATE = {
+        WAIT_BOUNDARY: 0,  // 等待 "--boundary\r\n"
+        IN_HEADER: 1,       // 正在解析 header 行
+        IN_DATA: 2,         // 正在接收 JPEG 数据
+        SKIP_CRLF: 3        // 跳过数据后的 \r\n
+      };
+      this.state = this.STATE.WAIT_BOUNDARY;
+      this.boundaryStr = '';     // 如 "--frame"
+      this.boundaryCrlf = null; // "--frame\r\n" 的字节数组
+      this.headerBuf = [];       // 收集 header 行
+      this.dataLen = 0;         // 从 Content-Length 解析
+      this.dataRecv = 0;        // 已接收的 JPEG 数据字节数
+      this.jpegBuf = null;       // 收集 JPEG 数据
+      this.debugFrameCount = 0;
     }
 
     async start(url) {
       if (this.running) return;
       this.running = true;
-      this.buffer = new Uint8Array(0);
+      this.lastUrl = url;  // 保存 URL，重连时使用
+      this.state = this.STATE.WAIT_BOUNDARY;
+      this._hdrLines = [];
+      this._hdrLineBuf = [];
+      this.jpegBuf = null;
+      this.debugFrameCount = 0;
 
       this.abortCtrl = new AbortController();
       try {
@@ -449,10 +469,7 @@
           console.error('[MJPEG] HTTP error:', resp.status, resp.statusText);
           this.running = false;
           try { onStreamError('mjpeg'); } catch(e) {}
-          setTimeout(() => {
-            try { onStreamOk('mjpeg'); } catch(e) {}
-            this.start(url);
-          }, 3000);
+          setTimeout(() => this.start(url), 3000);
           return;
         }
         const ct = resp.headers.get('Content-Type') || '';
@@ -462,12 +479,12 @@
           this.running = false;
           return;
         }
-        // 每个 part 以 "--boundary\r\n" 开头
-        this.boundary = new TextEncoder().encode('--' + m[1] + '\r\n');
-        // 调整 canvas 显示尺寸
+        this.boundaryStr = '--' + m[1];
+        this.boundaryCrlf = new TextEncoder().encode(this.boundaryStr + '\r\n');
+        console.log('[MJPEG] start, boundary="' + this.boundaryStr + '"');
         this.canvas.style.display = 'block';
         this.reader = resp.body.getReader();
-        await this.readLoop(url);
+        await this.readLoop();
       } catch (e) {
         if (e.name === 'AbortError') {
           console.log('[MJPEG] fetch aborted');
@@ -481,22 +498,20 @@
       }
     }
 
-    async readLoop(url) {
+    async readLoop() {
       while (this.running) {
         try {
           const { done, value } = await this.reader.read();
           if (done) {
-            console.log('[MJPEG] stream ended');
+            console.log('[MJPEG] stream ended, frames=' + this.debugFrameCount);
             this.running = false;
-            setTimeout(() => this.start(url), 2000);
+            setTimeout(() => this.start(this.lastUrl), 2000);
             break;
           }
-          // 追加到 buffer
-          const nb = new Uint8Array(this.buffer.length + value.length);
-          nb.set(this.buffer);
-          nb.set(value, this.buffer.length);
-          this.buffer = nb;
-          this.parseFrames();
+          // 逐字节喂入状态机
+          for (let i = 0; i < value.length; i++) {
+            this.feedByte(value[i]);
+          }
         } catch (e) {
           if (e.name !== 'AbortError') {
             console.error('[MJPEG] readLoop error:', e);
@@ -507,98 +522,181 @@
       }
     }
 
-    parseFrames() {
-      const b = this.boundary;
-      if (!b) return;
-
-      while (this.running) {
-        if (this.buffer.length < b.length) break;
-
-        // 找到当前 part 的起始边界 "--frame\r\n"
-        let b1 = this.findSubarray(this.buffer, b, 0);
-        if (b1 === -1) {
-          // 保留末尾（避免边界被截断）
-          if (this.buffer.length > b.length) {
-            this.buffer = this.buffer.slice(this.buffer.length - b.length);
-          } else {
-            this.buffer = new Uint8Array(0);
-          }
+    // 状态机：逐字节解析 multipart 流
+    feedByte(b) {
+      switch (this.state) {
+        case this.STATE.WAIT_BOUNDARY:
+          this.feedBoundary(b);
           break;
-        }
-
-        // b1 是 "--frame\r\n" 的起点，part header 紧随其后
-        const headerStart = b1 + b.length;
-
-        // 找到 header 结束标记 \r\n\r\n
-        const sep = this.findSubarray(this.buffer, new Uint8Array([0x0D,0x0A,0x0D,0x0A]), headerStart);
-        if (sep === -1) break;  // header 还没收完整
-
-        // 解析 Content-Length
-        const headerBytes = this.buffer.slice(headerStart, sep);
-        const headerText = new TextDecoder('latin1').decode(headerBytes);
-        const lm = /Content-Length:\s*(\d+)/i.exec(headerText);
-        if (!lm) {
-          // 没有 Content-Length，跳到下一个 boundary
-          const nextB = this.findSubarray(this.buffer, b, b1 + 1);
-          if (nextB === -1) break;
-          this.buffer = this.buffer.slice(nextB);
-          continue;
-        }
-
-        const dataLen = parseInt(lm[1]);
-        const dataStart = sep + 4;  // \r\n\r\n 之后是 JPEG 数据
-
-        if (this.buffer.length < dataStart + dataLen + 2) break;  // 数据不够（留2字节给末尾 \r\n）
-
-        // 提取 JPEG 数据
-        const jpegBytes = this.buffer.slice(dataStart, dataStart + dataLen);
-
-        // 用 createImageBitmap 解码并画到 canvas（不阻塞，但按顺序处理）
-        const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-        createImageBitmap(blob).then(bmp => {
-          // 首次成功解码，通知 UI 隐藏占位符
-          if (!this.streamOk) {
-            this.streamOk = true;
-            try { onStreamOk('mjpeg'); } catch(e) {}
-          }
-          // 动态适配 canvas 像素尺寸，避免模糊
-          const containerW = this.canvas.clientWidth;
-          const containerH = this.canvas.clientHeight;
-          if (this.canvas.width !== containerW || this.canvas.height !== containerH) {
-            this.canvas.width = containerW;
-            this.canvas.height = containerH;
-          }
-          // 保持宽高比居中绘制
-          const scale = Math.min(containerW / bmp.width, containerH / bmp.height);
-          const dw = Math.round(bmp.width * scale);
-          const dh = Math.round(bmp.height * scale);
-          const dx = Math.round((containerW - dw) / 2);
-          const dy = Math.round((containerH - dh) / 2);
-          this.ctx.clearRect(0, 0, containerW, containerH);
-          this.ctx.drawImage(bmp, dx, dy, dw, dh);
-        }).catch(e => {
-          // 解码失败，忽略这一帧
-        });
-
-        // 跳过 JPEG 数据 + 末尾 \r\n，定位到下一个 part 的起始
-        let nextPos = dataStart + dataLen;
-        if (nextPos + 2 <= this.buffer.length &&
-            this.buffer[nextPos] === 0x0D && this.buffer[nextPos+1] === 0x0A) {
-          nextPos += 2;  // 跳过 \r\n
-        }
-        this.buffer = this.buffer.slice(nextPos);
+        case this.STATE.IN_HEADER:
+          this.feedHeader(b);
+          break;
+        case this.STATE.IN_DATA:
+          this.feedData(b);
+          break;
+        case this.STATE.SKIP_CRLF:
+          this.feedSkipCrlf(b);
+          break;
       }
     }
 
-    findSubarray(haystack, needle, start) {
-      for (let i = start; i <= haystack.length - needle.length; i++) {
-        let ok = true;
-        for (let j = 0; j < needle.length; j++) {
-          if (haystack[i+j] !== needle[j]) { ok = false; break; }
+    // 状态：等待 "--boundary\r\n"
+    // 用逐字节比较，避免二进制误匹配
+    feedBoundary(b) {
+      // 我们维护一个滑动窗口，匹配 boundaryCrlf
+      // 简便做法：直接用数组收集，直到匹配成功或超时
+      // 这里用更简单的办法：维护一个 pos，表示已匹配的 boundaryCrlf 字节数
+      if (!this._bWaitBuf) this._bWaitBuf = [];
+      this._bWaitBuf.push(b);
+
+      // 检查末尾是否匹配 boundaryCrlf
+      const bc = this.boundaryCrlf;
+      if (this._bWaitBuf.length >= bc.length) {
+        let match = true;
+        for (let i = 0; i < bc.length; i++) {
+          if (this._bWaitBuf[this._bWaitBuf.length - bc.length + i] !== bc[i]) {
+            match = false;
+            break;
+          }
         }
-        if (ok) return i;
+        if (match) {
+          // 找到 boundary，切换到 IN_HEADER 状态
+          this.state = this.STATE.IN_HEADER;
+          this._bWaitBuf = null;
+          this._hdrLineBuf = [];  // 收集当前 header 行
+          return;
+        }
       }
-      return -1;
+
+      // 防止 _bWaitBuf 无限增长（最多保留 bc.length 字节）
+      if (this._bWaitBuf.length > bc.length) {
+        this._bWaitBuf = this._bWaitBuf.slice(this._bWaitBuf.length - bc.length);
+      }
+    }
+
+    // 状态：解析 header（每行以 \r\n 结束）
+    feedHeader(b) {
+      if (b === 0x0D) {
+        // 可能是 \r\n 的开始
+        this._hdrGotCR = true;
+        return;
+      }
+      if (this._hdrGotCR && b === 0x0A) {
+        // 收到完整行
+        const line = String.fromCharCode(...this._hdrLineBuf);
+        this._hdrLineBuf = [];
+        this._hdrGotCR = false;
+
+        if (line === '') {
+          // 空行 = header 结束，切换到 IN_DATA
+          // 解析收集到的 header
+          let dataLen = 0;
+          for (const h of this._hdrLines) {
+            const lm = /^Content-Length:\s*(\d+)/i.exec(h);
+            if (lm) dataLen = parseInt(lm[1]);
+          }
+          if (dataLen > 0) {
+            this.dataLen = dataLen;
+            this.dataRecv = 0;
+            this.jpegBuf = new Uint8Array(dataLen);
+            this.state = this.STATE.IN_DATA;
+          } else {
+            // 没有 Content-Length，回到 WAIT_BOUNDARY
+            this.state = this.STATE.WAIT_BOUNDARY;
+          }
+          this._hdrLines = [];
+          return;
+        }
+
+        this._hdrLines = this._hdrLines || [];
+        this._hdrLines.push(line);
+        return;
+      }
+
+      this._hdrGotCR = false;
+      this._hdrLineBuf = this._hdrLineBuf || [];
+      this._hdrLineBuf.push(b);
+    }
+
+    // 状态：接收 JPEG 数据
+    feedData(b) {
+      if (this.dataRecv < this.dataLen) {
+        this.jpegBuf[this.dataRecv] = b;
+        this.dataRecv++;
+      }
+
+      if (this.dataRecv >= this.dataLen) {
+        // JPEG 数据接收完成，解码并显示
+        this.onJpegFrame(this.jpegBuf);
+        // 跳过末尾 \r\n（2字节），然后回到 WAIT_BOUNDARY
+        this._skipCrlfCount = 0;
+        this.state = this.STATE.SKIP_CRLF;
+      }
+    }
+
+    // 状态：跳过 JPEG 数据后的 \r\n（2字节），然后回到 WAIT_BOUNDARY
+    feedSkipCrlf(b) {
+      if (this._skipCrlfCount === 0 && b === 0x0D) {
+        this._skipCrlfCount = 1;
+        return;
+      }
+      if (this._skipCrlfCount === 1 && b === 0x0A) {
+        this._skipCrlfCount = 0;
+        this.state = this.STATE.WAIT_BOUNDARY;
+        return;
+      }
+      // 格式异常：\r\n 不匹配，强制回到 WAIT_BOUNDARY
+      console.warn('[MJPEG] unexpected bytes after JPEG data, expected \\r\\n');
+      this._skipCrlfCount = 0;
+      this.state = this.STATE.WAIT_BOUNDARY;
+    }
+
+    onJpegFrame(jpegBytes) {
+      this.debugFrameCount++;
+      // 验证 JPEG 开头和结尾
+      if (jpegBytes.length < 2 ||
+          jpegBytes[0] !== 0xFF || jpegBytes[1] !== 0xD8) {
+        console.warn('[MJPEG] frame #' + this.debugFrameCount +
+                     ': bad JPEG SOI (0x' + jpegBytes[0].toString(16) +
+                     ' 0x' + jpegBytes[1].toString(16) + ')');
+        return;
+      }
+      if (jpegBytes.length >= 2) {
+        const last1 = jpegBytes[jpegBytes.length - 2];
+        const last2 = jpegBytes[jpegBytes.length - 1];
+        if (last1 !== 0xFF || last2 !== 0xD9) {
+          console.warn('[MJPEG] frame #' + this.debugFrameCount +
+                       ': bad JPEG EOI (0x' + last1.toString(16) +
+                       ' 0x' + last2.toString(16) + '), len=' + jpegBytes.length);
+        }
+      }
+
+      const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+      createImageBitmap(blob).then(bmp => {
+        if (!this.running) return;  // 已停止，忽略
+        if (!this.streamOk) {
+          this.streamOk = true;
+          try { onStreamOk('mjpeg'); } catch(e) {}
+          console.log('[MJPEG] first frame decoded, size=' +
+                      bmp.width + 'x' + bmp.height);
+        }
+        // 适配 canvas 尺寸
+        const cw = this.canvas.clientWidth;
+        const ch = this.canvas.clientHeight;
+        if (this.canvas.width !== cw || this.canvas.height !== ch) {
+          this.canvas.width = cw;
+          this.canvas.height = ch;
+        }
+        const scale = Math.min(cw / bmp.width, ch / bmp.height);
+        const dw = Math.round(bmp.width * scale);
+        const dh = Math.round(bmp.height * scale);
+        const dx = Math.round((cw - dw) / 2);
+        const dy = Math.round((ch - dh) / 2);
+        this.ctx.clearRect(0, 0, cw, ch);
+        this.ctx.drawImage(bmp, dx, dy, dw, dh);
+      }).catch(e => {
+        console.warn('[MJPEG] frame #' + this.debugFrameCount + ' decode error:', e);
+      });
     }
 
     stop() {
@@ -611,10 +709,11 @@
         try { this.reader.cancel(); } catch(e) {}
         this.reader = null;
       }
-      // 清空 canvas
-      const containerW = this.canvas.clientWidth;
-      const containerH = this.canvas.clientHeight;
-      this.ctx.clearRect(0, 0, containerW, containerH);
+      const cw = this.canvas.clientWidth;
+      const ch = this.canvas.clientHeight;
+      if (cw > 0 && ch > 0) {
+        this.ctx.clearRect(0, 0, cw, ch);
+      }
       this.canvas.style.display = 'none';
     }
   }
