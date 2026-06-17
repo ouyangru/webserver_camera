@@ -1,53 +1,81 @@
-include $(TOPDIR)/rules.mk
+# 因为文件中既有 C 文件也有 C++ 文件，所以分别指定编译器。
+CC ?= gcc
+CXX ?= g++
+PKG_CONFIG ?= pkg-config
+ENABLE_GSTREAMER ?= 0
 
-PKG_NAME:=webserver_camera
-PKG_VERSION:=1.0
-PKG_RELEASE:=1
+CFLAGS ?= -Wall -O2
+CXXFLAGS ?= -Wall -O2
+CFLAGS += -Iinclude
+CXXFLAGS += -std=c++11 -Iinclude
+CXXFLAGS += -DENABLE_GSTREAMER=$(ENABLE_GSTREAMER)
+LDFLAGS += -lpthread -lstdc++
 
-PKG_BUILD_DIR := $(BUILD_DIR)/$(PKG_NAME)
+SRC_DIR=src
+OBJ_DIR=obj
+BIN_DIR=bin
+TOOLS_DIR=tools
 
-include $(INCLUDE_DIR)/package.mk
+# 默认只构建 HTTP、线程池、V4L2 和 MJPEG。
+# rtsp_server.cpp 依赖 GStreamer，只有 ENABLE_GSTREAMER=1 时才加入构建。
+C_SRCS=$(wildcard $(SRC_DIR)/*.c)
+CPP_SRCS=$(filter-out $(SRC_DIR)/rtsp_server.cpp,$(wildcard $(SRC_DIR)/*.cpp))
 
-define Package/$(PKG_NAME)
-	SUBMENU:=Vision
-	SECTION:=allwinner
-	CATEGORY:=Allwinner
-	TITLE:=webserver camera demo (HLS + RTSP)
-	DEPENDS:=+libpthread +libstdcpp +gstreamer1 +gst1-rtsp-server +gst1-plugins-base +gst1-plugins-good +gst1-plugins-bad
-endef
+ifeq ($(ENABLE_GSTREAMER),1)
+GST_PACKAGES=gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0
+GST_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(GST_PACKAGES))
+GST_LIBS := $(shell $(PKG_CONFIG) --libs $(GST_PACKAGES))
+CPP_SRCS += $(SRC_DIR)/rtsp_server.cpp
+CXXFLAGS += $(GST_CFLAGS)
+LDFLAGS += $(GST_LIBS)
+endif
 
-define Package/$(PKG_NAME)/description
-	HTTP server with HLS streaming and a GStreamer RTSP server.
-endef
+C_OBJS=$(C_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+CPP_OBJS=$(CPP_SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
-define Build/Prepare
-	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src $(PKG_BUILD_DIR)/
-	$(CP) ./include $(PKG_BUILD_DIR)/
-	$(CP) ./makefile $(PKG_BUILD_DIR)/Makefile
-	$(CP) ./resources $(PKG_BUILD_DIR)/
-	$(CP) ./scripts $(PKG_BUILD_DIR)/
-endef
+TARGET=$(BIN_DIR)/my_program
+FLV_TOOL=$(BIN_DIR)/h264_to_flv
+FLV_TOOL_OBJ=$(OBJ_DIR)/h264_to_flv_tool.o
+FLV_MEDIA_OBJS=$(OBJ_DIR)/h264_parser.o $(OBJ_DIR)/flv_muxer.o
+MEDIA_TEST=$(BIN_DIR)/media_pipeline_test
+MEDIA_TEST_OBJ=$(OBJ_DIR)/media_pipeline_test.o
 
-define Build/Compile
-	$(MAKE) -C $(PKG_BUILD_DIR) \
-		ARCH="$(TARGET_ARCH)" \
-		AR="$(TARGET_AR)" \
-		CC="$(TARGET_CC)" \
-		CXX="$(TARGET_CXX)" \
-		CFLAGS="$(TARGET_CFLAGS)" \
-		CXXFLAGS="$(TARGET_CXXFLAGS)" \
-		LDFLAGS="$(TARGET_LDFLAGS)" \
-		all
-endef
+all: $(TARGET) $(FLV_TOOL)
 
-define Package/$(PKG_NAME)/install
-	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/my_program $(1)/usr/bin/webserver_camera
+$(TARGET): $(C_OBJS) $(CPP_OBJS)
+	mkdir -p $(BIN_DIR)
+	$(CXX) -o $@ $^ $(LDFLAGS)
 
-	$(INSTALL_DIR) $(1)/usr/share/webserver_camera
-	$(CP) $(PKG_BUILD_DIR)/resources $(1)/usr/share/webserver_camera/
-	$(CP) $(PKG_BUILD_DIR)/scripts $(1)/usr/share/webserver_camera/
-endef
+$(FLV_TOOL): $(FLV_TOOL_OBJ) $(FLV_MEDIA_OBJS)
+	mkdir -p $(BIN_DIR)
+	$(CXX) -o $@ $^
 
-$(eval $(call BuildPackage,$(PKG_NAME)))
+$(FLV_TOOL_OBJ): $(TOOLS_DIR)/h264_to_flv.cpp
+	mkdir -p $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(MEDIA_TEST): $(MEDIA_TEST_OBJ) $(FLV_MEDIA_OBJS)
+	mkdir -p $(BIN_DIR)
+	$(CXX) -o $@ $^
+
+$(MEDIA_TEST_OBJ): tests/media_pipeline_test.cpp
+	mkdir -p $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+test-media: $(MEDIA_TEST)
+	./$(MEDIA_TEST)
+
+# C 文件编译规则
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+	mkdir -p $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# C++ 文件编译规则
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
+	mkdir -p $(OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(OBJ_DIR)/*.o $(BIN_DIR)/my_program $(BIN_DIR)/h264_to_flv $(MEDIA_TEST)
+
+.PHONY: all clean test-media
