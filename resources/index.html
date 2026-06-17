@@ -430,6 +430,10 @@
   //       用字节偏移从二进制 buffer 中提取 JPEG 数据。
   //       即使 JPEG 二进制数据中偶然出现相同字节序列，后续的
   //       \r\n\r\n + Content-Length 头部验证会过滤掉误匹配。
+    // ---- MJPEG Viewer v4: pure binary byte comparison ----
+  // All parsing done on Uint8Array with no TextDecoder conversion.
+  // Eliminates text-offset vs binary-offset mismatch that caused
+  // JPEG data truncation in v3.
   class MjpegViewer {
     constructor(canvasId) {
       this.canvas = document.getElementById(canvasId);
@@ -438,10 +442,13 @@
       this.reader = null;
       this.running = false;
       this.streamOk = false;
-      this.buffer = new Uint8Array(0);   // 累积缓冲区
+      this.buffer = new Uint8Array(0);
       this.frameCount = 0;
       this.lastUrl = '';
-      this.drawSeq = 0;          // 绘制序列号，防止异步竞争
+      this.drawSeq = 0;
+      // Pre-computed binary patterns for fast matching
+      this.BOUNDARY = new Uint8Array([0x2D,0x2D,0x66,0x72,0x61,0x6D,0x65,0x0D,0x0A]); // "--frame\r\n"
+      this.CRLF_CRLF = new Uint8Array([0x0D,0x0A,0x0D,0x0A]); // "\r\n\r\n"
     }
 
     async start(url) {
@@ -451,29 +458,18 @@
       this.buffer = new Uint8Array(0);
       this.frameCount = 0;
       this.streamOk = false;
-
       this.abortCtrl = new AbortController();
       try {
-        console.log('[MJPEG] fetching', url);
+        console.log('[MJPEG-v4] fetching', url);
         const resp = await fetch(url, { signal: this.abortCtrl.signal });
-        if (!resp.ok) {
-          console.error('[MJPEG] HTTP', resp.status);
-          this.running = false;
-          this._reconnect();
-          return;
-        }
-        const ct = resp.headers.get('Content-Type') || '';
-        console.log('[MJPEG] Content-Type:', ct);
-
+        if (!resp.ok) { console.error('[MJPEG-v4] HTTP', resp.status); this.running = false; this._reconnect(); return; }
+        console.log('[MJPEG-v4] CT:', resp.headers.get('Content-Type'));
         this.canvas.style.display = 'block';
         this.reader = resp.body.getReader();
         await this._readLoop();
       } catch (e) {
-        if (e.name === 'AbortError') {
-          console.log('[MJPEG] aborted');
-        } else {
-          console.error('[MJPEG] fetch error:', e);
-        }
+        if (e.name === 'AbortError') { console.log('[MJPEG-v4] aborted'); }
+        else { console.error('[MJPEG-v4] fetch err:', e); }
         this.running = false;
         this._reconnect();
       }
@@ -489,146 +485,130 @@
       while (this.running) {
         try {
           const { done, value } = await this.reader.read();
-          if (done) {
-            console.log('[MJPEG] stream ended, total frames=' + this.frameCount);
-            this.running = false;
-            this._reconnect();
-            break;
-          }
-          // 追加到缓冲区
+          if (done) { console.log('[MJPEG-v4] stream end, frames=' + this.frameCount); this.running = false; this._reconnect(); break; }
           const nb = new Uint8Array(this.buffer.length + value.length);
           nb.set(this.buffer);
           nb.set(value, this.buffer.length);
           this.buffer = nb;
-          // 尝试解析帧
           this._extractFrames();
         } catch (e) {
-          if (e.name !== 'AbortError') console.error('[MJPEG] read error:', e);
-          this.running = false;
-          break;
+          if (e.name !== 'AbortError') console.error('[MJPEG-v4] read err:', e);
+          this.running = false; break;
         }
       }
     }
 
+    _findBytes(buf, pattern, start) {
+      const plen = pattern.length;
+      for (let i = start; i <= buf.length - plen; i++) {
+        let ok = true;
+        for (let j = 0; j < plen; j++) { if (buf[i+j] !== pattern[j]) { ok = false; break; } }
+        if (ok) return i;
+      }
+      return -1;
+    }
+
     _extractFrames() {
-      // 将缓冲区转为文本用于搜索（Latin-1 是字节恒等映射）
-      const text = new TextDecoder('latin1').decode(this.buffer);
-      const BOUNDARY = '--frame\r\n';
-      let searchPos = 0;
+      const B = this.BOUNDARY;
+      const CC = this.CRLF_CRLF;
 
-      while (true) {
-        // 1. 查找 boundary
-        const bIdx = text.indexOf(BOUNDARY, searchPos);
-        if (bIdx === -1) break;
+      const bIdx = this._findBytes(this.buffer, B, 0);
+      if (bIdx === -1) return;
 
-        // 2. 查找 header 结束标记 \r\n\r\n
-        const hdrStart = bIdx + BOUNDARY.length;
-        const hdrEnd = text.indexOf('\r\n\r\n', hdrStart);
-        if (hdrEnd === -1) break; // header 还没收完
+      const hdrStart = bIdx + B.length;
+      const hdrEnd = this._findBytes(this.buffer, CC, hdrStart);
+      if (hdrEnd === -1) return;
 
-        // 3. 解析 Content-Length
-        const hdrText = text.substring(hdrStart, hdrEnd);
-        const clMatch = /Content-Length:\s*(\d+)/i.exec(hdrText);
-        if (!clMatch) {
-          console.warn('[MJPEG] no Content-Length in header, skipping');
-          searchPos = bIdx + 1;
-          continue;
-        }
-        const contentLen = parseInt(clMatch[1], 10);
-
-        // 4. 计算 JPEG 在二进制 buffer 中的位置
-        const jpegStart = hdrEnd + 4; // 跳过 \r\n\r\n
-        const jpegEnd = jpegStart + contentLen;
-
-        // 5. 检查 buffer 是否有足够的数据
-        if (jpegEnd > this.buffer.length) break; // 数据不够，等下一次
-
-        // 6. 提取 JPEG 数据
-        const jpegBytes = this.buffer.slice(jpegStart, jpegEnd);
-
-        // 7. 验证 JPEG SOI 标记 (FF D8)
-        if (jpegBytes.length < 2 || jpegBytes[0] !== 0xFF || jpegBytes[1] !== 0xD8) {
-          console.warn('[MJPEG] bad SOI at frame #' + (this.frameCount+1) +
-            ': (0x' + (jpegBytes[0]??0).toString(16) +
-            ' 0x' + (jpegBytes[1]??0).toString(16) +
-            ') cl=' + contentLen + ' bIdx=' + bIdx +
-            ' hdr="' + hdrText.replace(/\r?\n/g, '|') + '"');
-          // 不是有效的帧，跳过，从 boundary 后继续搜索
-          searchPos = bIdx + 1;
-          continue;
-        }
-
-        // 8. 显示这一帧
-        this.frameCount++;
-        this._displayFrame(jpegBytes);
-
-        // 9. 推进缓冲区：跳过 JPEG + 末尾可能的 \r\n
-        let consumeEnd = jpegEnd;
-        if (consumeEnd + 2 <= this.buffer.length &&
-            this.buffer[consumeEnd] === 0x0D &&
-            this.buffer[consumeEnd + 1] === 0x0A) {
-          consumeEnd += 2;
-        }
-        this.buffer = this.buffer.slice(consumeEnd);
-        // buffer 已更新，退出循环让下次重新 decode
+      // Parse Content-Length from header region using binary comparison
+      const hdrRegion = this.buffer.slice(hdrStart, hdrEnd);
+      let contentLen = -1;
+      // "Content-Length:" in ASCII bytes
+      const CL = [0x43,0x6F,0x6E,0x74,0x65,0x6E,0x74,0x2D,0x4C,0x65,0x6E,0x67,0x74,0x68,0x3A];
+      const cl = [0x63,0x6F,0x6E,0x74,0x65,0x6E,0x74,0x2D,0x6C,0x65,0x6E,0x67,0x74,0x68,0x3A];
+      for (const prefix of [CL, cl]) {
+        const clPos = this._findBytes(hdrRegion, prefix, 0);
+        if (clPos === -1) continue;
+        let ns = clPos + prefix.length;
+        while (ns < hdrRegion.length && hdrRegion[ns] === 0x20) ns++;
+        let ne = ns;
+        while (ne < hdrRegion.length && hdrRegion[ne] !== 0x0D) ne++;
+        let val = 0;
+        for (let k = ns; k < ne; k++) { val = val * 10 + (hdrRegion[k] - 0x30); }
+        contentLen = val;
         break;
       }
+
+      if (contentLen <= 0) {
+        console.warn('[MJPEG-v4] bad CL at bIdx=' + bIdx);
+        this.buffer = this.buffer.slice(bIdx + 1);
+        return;
+      }
+
+      const jpegStart = hdrEnd + CC.length;
+      const jpegEnd = jpegStart + contentLen;
+      if (jpegEnd > this.buffer.length) return;
+
+      const jpegBytes = this.buffer.slice(jpegStart, jpegEnd);
+
+      // SOI verify
+      if (jpegBytes.length < 2 || jpegBytes[0] !== 0xFF || jpegBytes[1] !== 0xD8) {
+        var near = Math.min(24, jpegBytes.length);
+        var hex = '';
+        for (var ii = 0; ii < near; ii++) hex += ((jpegBytes[ii]<16)?'0':'') + jpegBytes[ii].toString(16) + ' ';
+        console.warn('[MJPEG-v4] bad SOI #' + (this.frameCount+1) +
+          ': (0x' + (jpegBytes[0]??0).toString(16) + ' 0x' + (jpegBytes[1]??0).toString(16) +
+          ') len=' + jpegBytes.length + ' cl=' + contentLen +
+          ' bIdx=' + bIdx + ' hdrS=' + hdrStart + ' hdrE=' + hdrEnd +
+          ' jpgS=' + jpegStart + ' jpgE=' + jpegEnd + ' buf=' + this.buffer.length +
+          ' | hex=' + hex);
+        this.buffer = this.buffer.slice(bIdx + 1);
+        return;
+      }
+
+      this.frameCount++;
+      this._displayFrame(jpegBytes);
+
+      let consumeEnd = jpegEnd;
+      if (consumeEnd+2 <= this.buffer.length &&
+          this.buffer[consumeEnd]===0x0D && this.buffer[consumeEnd+1]===0x0A)
+        consumeEnd += 2;
+      this.buffer = this.buffer.slice(consumeEnd);
     }
 
     _displayFrame(jpegBytes) {
       const seq = ++this.drawSeq;
       const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
       createImageBitmap(blob).then(bmp => {
-        // 只绘制最新帧，丢弃过时的异步结果
         if (seq !== this.drawSeq || !this.running) return;
-
         if (!this.streamOk) {
           this.streamOk = true;
           try { onStreamOk('mjpeg'); } catch(e) {}
-          console.log('[MJPEG] first frame OK! size=' + bmp.width + 'x' + bmp.height +
-                      ', jpeg_len=' + jpegBytes.length);
+          console.log('[MJPEG-v4] FIRST FRAME OK! ' + bmp.width+'x'+bmp.height +
+            ' jpeg=' + jpegBytes.length + ' frames=' + this.frameCount);
         }
-
-        const cw = this.canvas.clientWidth;
-        const ch = this.canvas.clientHeight;
+        const cw = this.canvas.clientWidth, ch = this.canvas.clientHeight;
         if (cw > 0 && ch > 0) {
-          if (this.canvas.width !== cw || this.canvas.height !== ch) {
-            this.canvas.width = cw;
-            this.canvas.height = ch;
-          }
-          const scale = Math.min(cw / bmp.width, ch / bmp.height);
-          const dw = Math.round(bmp.width * scale);
-          const dh = Math.round(bmp.height * scale);
-          const dx = Math.round((cw - dw) / 2);
-          const dy = Math.round((ch - dh) / 2);
-          this.ctx.clearRect(0, 0, cw, ch);
-          this.ctx.drawImage(bmp, dx, dy, dw, dh);
+          if (this.canvas.width!==cw||this.canvas.height!==ch) { this.canvas.width=cw; this.canvas.height=ch; }
+          const s=Math.min(cw/bmp.width,ch/bmp.height);
+          this.ctx.clearRect(0,0,cw,ch);
+          this.ctx.drawImage(bmp,
+            Math.round((cw-bmp.width*s)/2), Math.round((ch-bmp.height*s)/2),
+            Math.round(bmp.width*s), Math.round(bmp.height*s));
         }
-      }).catch(e => {
-        console.warn('[MJPEG] decode err:', e.message || e);
-      });
+      }).catch(e => { console.warn('[MJPEG-v4] decode err:', e.message||e); });
     }
 
     stop() {
       this.running = false;
-      if (this.abortCtrl) {
-        try { this.abortCtrl.abort(); } catch(e) {}
-        this.abortCtrl = null;
-      }
-      if (this.reader) {
-        try { this.reader.cancel(); } catch(e) {}
-        this.reader = null;
-      }
-      const cw = this.canvas.clientWidth;
-      const ch = this.canvas.clientHeight;
-      if (cw > 0 && ch > 0) {
-        try { this.ctx.clearRect(0, 0, cw, ch); } catch(e) {}
-      }
-      this.canvas.style.display = 'none';
+      if (this.abortCtrl) { try { this.abortCtrl.abort(); } catch(e){} this.abortCtrl=null; }
+      if (this.reader) { try { this.reader.cancel(); } catch(e){} this.reader=null; }
+      try { this.ctx.clearRect(0,0,this.canvas.clientWidth,this.canvas.clientHeight); } catch(e){}
+      this.canvas.style.display='none';
     }
   }
 
-let mjpegViewer = null;
+
+  let mjpegViewer = null;
 
   // ---- Log ----
   function log(msg, type) {
