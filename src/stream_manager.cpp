@@ -286,7 +286,6 @@ void StreamManager::broadcast_mjpeg_packet(const std::shared_ptr<std::vector<uns
         }
     }
 
-    (void)frame_count;  // suppress unused warning if any
 
     lock();
     m_enqueued_packets += enqueued;
