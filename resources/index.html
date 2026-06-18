@@ -288,8 +288,8 @@
     </div>
 
     <div class="video-container" id="videoContainer">
-      <!-- MJPEG: JS 解析 multipart 流，用 canvas 渲染 -->
-      <canvas id="mjpegCanvas" style="display:block;width:100%;height:100%;background:#000;"></canvas>
+      <!-- MJPEG: 浏览器原生支持 img src 显示 multipart/x-mixed-replace -->
+      <img id="mjpegImg" src="" alt="MJPEG Stream" style="display:block;width:100%;height:100%;object-fit:contain;background:#000;">
       <!-- FLV -->
       <video id="flvView" controls autoplay muted playsinline style="display:none;width:100%;height:100%;"></video>
       <!-- HLS -->
@@ -425,190 +425,8 @@
   let clockInterval = null;
   let startTime = Date.now();
 
-  // ---- MJPEG Viewer v3: 文本搜索边界 + 二进制提取 ----
-  // 原理：在 Latin-1 文本视图中搜索 ASCII 边界字符串 "--frame\r\n"，
-  //       用字节偏移从二进制 buffer 中提取 JPEG 数据。
-  //       即使 JPEG 二进制数据中偶然出现相同字节序列，后续的
-  //       \r\n\r\n + Content-Length 头部验证会过滤掉误匹配。
-    // ---- MJPEG Viewer v4: pure binary byte comparison ----
-  // All parsing done on Uint8Array with no TextDecoder conversion.
-  // Eliminates text-offset vs binary-offset mismatch that caused
-  // JPEG data truncation in v3.
-  class MjpegViewer {
-    constructor(canvasId) {
-      this.canvas = document.getElementById(canvasId);
-      this.ctx = this.canvas.getContext('2d');
-      this.abortCtrl = null;
-      this.reader = null;
-      this.running = false;
-      this.streamOk = false;
-      this.buffer = new Uint8Array(0);
-      this.frameCount = 0;
-      this.lastUrl = '';
-      this.drawSeq = 0;
-      // Pre-computed binary patterns for fast matching
-      this.BOUNDARY = new Uint8Array([0x2D,0x2D,0x66,0x72,0x61,0x6D,0x65,0x0D,0x0A]); // "--frame\r\n"
-      this.CRLF_CRLF = new Uint8Array([0x0D,0x0A,0x0D,0x0A]); // "\r\n\r\n"
-    }
-
-    async start(url) {
-      if (this.running) return;
-      this.running = true;
-      this.lastUrl = url;
-      this.buffer = new Uint8Array(0);
-      this.frameCount = 0;
-      this.streamOk = false;
-      this.abortCtrl = new AbortController();
-      try {
-        console.log('[MJPEG-v4] fetching', url);
-        const resp = await fetch(url, { signal: this.abortCtrl.signal });
-        if (!resp.ok) { console.error('[MJPEG-v4] HTTP', resp.status); this.running = false; this._reconnect(); return; }
-        console.log('[MJPEG-v4] CT:', resp.headers.get('Content-Type'));
-        this.canvas.style.display = 'block';
-        this.reader = resp.body.getReader();
-        await this._readLoop();
-      } catch (e) {
-        if (e.name === 'AbortError') { console.log('[MJPEG-v4] aborted'); }
-        else { console.error('[MJPEG-v4] fetch err:', e); }
-        this.running = false;
-        this._reconnect();
-      }
-    }
-
-    _reconnect() {
-      if (!this.running && !this.abortCtrl?.signal.aborted && this.lastUrl) {
-        setTimeout(() => { if (!this.running) this.start(this.lastUrl); }, 3000);
-      }
-    }
-
-    async _readLoop() {
-      while (this.running) {
-        try {
-          const { done, value } = await this.reader.read();
-          if (done) { console.log('[MJPEG-v4] stream end, frames=' + this.frameCount); this.running = false; this._reconnect(); break; }
-          const nb = new Uint8Array(this.buffer.length + value.length);
-          nb.set(this.buffer);
-          nb.set(value, this.buffer.length);
-          this.buffer = nb;
-          this._extractFrames();
-        } catch (e) {
-          if (e.name !== 'AbortError') console.error('[MJPEG-v4] read err:', e);
-          this.running = false; break;
-        }
-      }
-    }
-
-    _findBytes(buf, pattern, start) {
-      const plen = pattern.length;
-      for (let i = start; i <= buf.length - plen; i++) {
-        let ok = true;
-        for (let j = 0; j < plen; j++) { if (buf[i+j] !== pattern[j]) { ok = false; break; } }
-        if (ok) return i;
-      }
-      return -1;
-    }
-
-    _extractFrames() {
-      const B = this.BOUNDARY;
-      const CC = this.CRLF_CRLF;
-
-      const bIdx = this._findBytes(this.buffer, B, 0);
-      if (bIdx === -1) return;
-
-      const hdrStart = bIdx + B.length;
-      const hdrEnd = this._findBytes(this.buffer, CC, hdrStart);
-      if (hdrEnd === -1) return;
-
-      // Parse Content-Length from header region using binary comparison
-      const hdrRegion = this.buffer.slice(hdrStart, hdrEnd);
-      let contentLen = -1;
-      // "Content-Length:" in ASCII bytes
-      const CL = [0x43,0x6F,0x6E,0x74,0x65,0x6E,0x74,0x2D,0x4C,0x65,0x6E,0x67,0x74,0x68,0x3A];
-      const cl = [0x63,0x6F,0x6E,0x74,0x65,0x6E,0x74,0x2D,0x6C,0x65,0x6E,0x67,0x74,0x68,0x3A];
-      for (const prefix of [CL, cl]) {
-        const clPos = this._findBytes(hdrRegion, prefix, 0);
-        if (clPos === -1) continue;
-        let ns = clPos + prefix.length;
-        while (ns < hdrRegion.length && hdrRegion[ns] === 0x20) ns++;
-        let ne = ns;
-        while (ne < hdrRegion.length && hdrRegion[ne] !== 0x0D) ne++;
-        let val = 0;
-        for (let k = ns; k < ne; k++) { val = val * 10 + (hdrRegion[k] - 0x30); }
-        contentLen = val;
-        break;
-      }
-
-      if (contentLen <= 0) {
-        console.warn('[MJPEG-v4] bad CL at bIdx=' + bIdx);
-        this.buffer = this.buffer.slice(bIdx + 1);
-        return;
-      }
-
-      const jpegStart = hdrEnd + CC.length;
-      const jpegEnd = jpegStart + contentLen;
-      if (jpegEnd > this.buffer.length) return;
-
-      const jpegBytes = this.buffer.slice(jpegStart, jpegEnd);
-
-      // SOI verify
-      if (jpegBytes.length < 2 || jpegBytes[0] !== 0xFF || jpegBytes[1] !== 0xD8) {
-        var near = Math.min(24, jpegBytes.length);
-        var hex = '';
-        for (var ii = 0; ii < near; ii++) hex += ((jpegBytes[ii]<16)?'0':'') + jpegBytes[ii].toString(16) + ' ';
-        console.warn('[MJPEG-v4] bad SOI #' + (this.frameCount+1) +
-          ': (0x' + (jpegBytes[0]??0).toString(16) + ' 0x' + (jpegBytes[1]??0).toString(16) +
-          ') len=' + jpegBytes.length + ' cl=' + contentLen +
-          ' bIdx=' + bIdx + ' hdrS=' + hdrStart + ' hdrE=' + hdrEnd +
-          ' jpgS=' + jpegStart + ' jpgE=' + jpegEnd + ' buf=' + this.buffer.length +
-          ' | hex=' + hex);
-        this.buffer = this.buffer.slice(bIdx + 1);
-        return;
-      }
-
-      this.frameCount++;
-      this._displayFrame(jpegBytes);
-
-      let consumeEnd = jpegEnd;
-      if (consumeEnd+2 <= this.buffer.length &&
-          this.buffer[consumeEnd]===0x0D && this.buffer[consumeEnd+1]===0x0A)
-        consumeEnd += 2;
-      this.buffer = this.buffer.slice(consumeEnd);
-    }
-
-    _displayFrame(jpegBytes) {
-      const seq = ++this.drawSeq;
-      const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-      createImageBitmap(blob).then(bmp => {
-        if (seq !== this.drawSeq || !this.running) return;
-        if (!this.streamOk) {
-          this.streamOk = true;
-          try { onStreamOk('mjpeg'); } catch(e) {}
-          console.log('[MJPEG-v4] FIRST FRAME OK! ' + bmp.width+'x'+bmp.height +
-            ' jpeg=' + jpegBytes.length + ' frames=' + this.frameCount);
-        }
-        const cw = this.canvas.clientWidth, ch = this.canvas.clientHeight;
-        if (cw > 0 && ch > 0) {
-          if (this.canvas.width!==cw||this.canvas.height!==ch) { this.canvas.width=cw; this.canvas.height=ch; }
-          const s=Math.min(cw/bmp.width,ch/bmp.height);
-          this.ctx.clearRect(0,0,cw,ch);
-          this.ctx.drawImage(bmp,
-            Math.round((cw-bmp.width*s)/2), Math.round((ch-bmp.height*s)/2),
-            Math.round(bmp.width*s), Math.round(bmp.height*s));
-        }
-      }).catch(e => { console.warn('[MJPEG-v4] decode err:', e.message||e); });
-    }
-
-    stop() {
-      this.running = false;
-      if (this.abortCtrl) { try { this.abortCtrl.abort(); } catch(e){} this.abortCtrl=null; }
-      if (this.reader) { try { this.reader.cancel(); } catch(e){} this.reader=null; }
-      try { this.ctx.clearRect(0,0,this.canvas.clientWidth,this.canvas.clientHeight); } catch(e){}
-      this.canvas.style.display='none';
-    }
-  }
-
-
-  let mjpegViewer = null;
+  // MJPEG: 浏览器原生支持 img src 解析 multipart/x-mixed-replace
+  // 无需任何 JS 解析器，Chrome/Edge/Safari/Firefox 均完美支持
 
   // ---- Log ----
   function log(msg, type) {
@@ -640,7 +458,7 @@
     });
 
     // Show/hide views
-    document.getElementById('mjpegCanvas').style.display = tab === 'mjpeg' ? 'block' : 'none';
+    document.getElementById('mjpegImg').style.display = tab === 'mjpeg' ? 'block' : 'none';
     document.getElementById('flvView').style.display  = tab === 'flv'    ? 'block' : 'none';
     document.getElementById('hlsView').style.display   = tab === 'hls'    ? 'block' : 'none';
     document.getElementById('placeholder').style.display = 'none';
@@ -649,11 +467,16 @@
 
     // Start player
     if (tab === 'mjpeg') {
-      if (!mjpegViewer) {
-        mjpegViewer = new MjpegViewer('mjpegCanvas');
-      }
-      mjpegViewer.start('/mjpeg');
-      log('Switched to MJPEG stream (JS parser)', 'info');
+      const img = document.getElementById('mjpegImg');
+      img.src = '/mjpeg';
+      img.onerror = () => {
+        showPlaceholder('MJPEG stream unavailable - is the camera running?');
+        log('MJPEG stream error', 'err');
+      };
+      img.onload = () => {
+        document.getElementById('placeholder').style.display = 'none';
+      };
+      log('Switched to MJPEG stream (native img)', 'info');
     } else if (tab === 'flv') {
       startFlvPlayer();
       log('Switched to HTTP-FLV stream', 'info');
@@ -664,11 +487,9 @@
   }
 
   function stopCurrentPlayer() {
-    // MJPEG - 停止 JS 解析器
-    if (mjpegViewer) {
-      mjpegViewer.stop();
-      mjpegViewer = null;
-    }
+    // MJPEG - 清空 img src 停止流
+    var mjpegImg = document.getElementById('mjpegImg');
+    if (mjpegImg) { mjpegImg.src = ''; mjpegImg.style.display = 'none'; }
 
     // FLV
     if (flvPlayer) {
@@ -679,22 +500,6 @@
     if (hlsPlayer) {
       try { hlsPlayer.destroy(); } catch(e) {}
       hlsPlayer = null;
-    }
-  }
-
-  // ---- MJPEG callbacks ----
-  function onStreamError(src) {
-    if (src === 'mjpeg' && currentTab === 'mjpeg') {
-      document.getElementById('placeholder').style.display = 'flex';
-      document.getElementById('placeholderMsg').textContent = 'MJPEG stream unavailable - is the camera running?';
-      document.getElementById('mjpegCanvas').style.display = 'none';
-      log('MJPEG stream error', 'err');
-    }
-  }
-  function onStreamOk(src) {
-    if (src === 'mjpeg' && currentTab === 'mjpeg') {
-      document.getElementById('placeholder').style.display = 'none';
-      document.getElementById('mjpegCanvas').style.display = 'block';
     }
   }
 
