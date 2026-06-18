@@ -12,9 +12,10 @@
 #include "shared_buffer.h"
 
 #define VIDEO_DEV "/dev/video0"
-#define V4L2_BUFFER_COUNT 4
+#define V4L2_BUFFER_COUNT 16
 #define DEFAULT_WIDTH 640
 #define DEFAULT_HEIGHT 480
+#define MIN_MJPEG_FRAME_SIZE (12 * 1024)
 
 struct v4l2_buf_unit {
     void *start;
@@ -50,6 +51,19 @@ static void publish_frame(const std::vector<unsigned char>& frame,
                           uint32_t pixel_format,
                           uint32_t driver_sequence) {
     if (frame.empty() || frame.size() > MAX_FRAME_SIZE) {
+        return;
+    }
+    if (pixel_format == V4L2_PIX_FMT_MJPEG &&
+        frame.size() < MIN_MJPEG_FRAME_SIZE) {
+        static uint64_t small_frame_count = 0;
+        small_frame_count++;
+        if (small_frame_count <= 5 || small_frame_count % 100 == 0) {
+            printf("[V4L2] drop suspicious small MJPEG driver_seq=%u "
+                   "bytes=%zu dropped=%lu\n",
+                   driver_sequence,
+                   frame.size(),
+                   (unsigned long)small_frame_count);
+        }
         return;
     }
 
