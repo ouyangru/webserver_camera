@@ -565,6 +565,7 @@ void http_conn::unmap() {
 }
 
 bool http_conn::write_stream() {
+    static uint64_t total_packets_sent = 0;
     while (true) {
         pthread_mutex_lock(&m_send_lock);
         if (m_sockfd == -1) {
@@ -594,6 +595,22 @@ bool http_conn::write_stream() {
             continue;
         }
 
+        bool is_new_packet = (m_send_offset == 0);
+        if (is_new_packet) {
+            total_packets_sent++;
+            // 对较大的包（帧数据）打印日志
+            if (packet->size() > 256 && (total_packets_sent <= 5 || total_packets_sent % 100 == 0)) {
+                printf("[SEND] fd=%d pkt#%llu size=%zu queue=%zu\n",
+                       m_sockfd, (unsigned long long)total_packets_sent,
+                       packet->size(), m_send_queue.size());
+                // 打印包的前32字节（hex）
+                printf("[SEND] first32=");
+                for (size_t b = 0; b < 32 && b < packet->size(); b++)
+                    printf("%02X ", (*packet)[b]);
+                printf("\n");
+            }
+        }
+
         ssize_t sent = send(m_sockfd,
                             packet->data() + m_send_offset,
                             packet->size() - m_send_offset,
@@ -604,6 +621,9 @@ bool http_conn::write_stream() {
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                printf("[SEND] fd=%d EAGAIN at offset=%zu/%zu pkt#%llu\n",
+                       m_sockfd, m_send_offset, packet->size(),
+                       (unsigned long long)total_packets_sent);
                 modfd(m_epollfd, m_sockfd, EPOLLIN | EPOLLOUT | EPOLLRDHUP);
                 pthread_mutex_unlock(&m_send_lock);
                 return true;
@@ -619,12 +639,17 @@ bool http_conn::write_stream() {
 
         m_send_offset += static_cast<size_t>(sent);
         if (m_send_offset >= packet->size()) {
+            if (packet->size() > 256 && total_packets_sent <= 5) {
+                printf("[SEND] fd=%d pkt#%llu COMPLETE size=%zu\n",
+                       m_sockfd, (unsigned long long)total_packets_sent,
+                       packet->size());
+            }
             m_send_queue.pop_front();
             m_send_offset = 0;
         }
         pthread_mutex_unlock(&m_send_lock);
     }
-    return true;  // while(true) 内所有退出路径都有 return，此处仅为消除编译器警告
+    return true;
 }
 
 bool http_conn::build_status_response() {

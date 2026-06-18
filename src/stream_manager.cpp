@@ -278,6 +278,16 @@ void StreamManager::broadcast_mjpeg_packet(const std::shared_ptr<std::vector<uns
         }
     }
 
+    // 前5帧或每100帧打详细诊断
+    {
+        static int detail_count = 0;
+        ++detail_count;
+        if (detail_count <= 5 || detail_count % 100 == 0) {
+            printf("[MJPEG] broadcast result: clients=%zu enqueued=%zu dropped=%zu\n",
+                   clients.size(), enqueued, dropped);
+        }
+    }
+
     if (enqueued == 0 && m_mjpeg_stats.frames > 3) {
         static int warn_count = 0;
         if (++warn_count % 100 == 0) {
@@ -609,15 +619,40 @@ void* mjpeg_stream_thread(void* arg) {
         memcpy(packet->data(), header_buf, static_cast<size_t>(header_len));
         memcpy(packet->data() + header_len, g_frame.data, len);
         memcpy(packet->data() + header_len + len, "\r\n", 2);
+
+        // 诊断日志：在锁内验证 JPEG 数据完整性（用 packet 中的拷贝，避免竞争）
+        unsigned char* jpeg_data = packet->data() + header_len;
+        size_t jpeg_len = len;
+        int jpeg_soi_ok = (jpeg_len >= 2 && jpeg_data[0] == 0xFF && jpeg_data[1] == 0xD8);
+        int jpeg_eoi_ok = (jpeg_len >= 2 && jpeg_data[jpeg_len-2] == 0xFF && jpeg_data[jpeg_len-1] == 0xD9);
+        
         pthread_mutex_unlock(&g_frame.lock);
 
         frame_count++;
-        if (frame_count <= 3 || frame_count % 100 == 0) {
-            printf("[MJPEG] broadcast frame #%d, seq=%lu, size=%zu, clients=%zu\n",
-                   frame_count, (unsigned long)last_sequence, len,
-                   manager->mjpeg_client_count());
+        if (frame_count <= 5 || frame_count % 50 == 0) {
+            printf("[MJPEG] frame #%d seq=%lu jpeg_size=%zu SOI=%s EOI=%s first16=",
+                   frame_count, (unsigned long)last_sequence, jpeg_len,
+                   jpeg_soi_ok ? "OK" : "MISSING",
+                   jpeg_eoi_ok ? "OK" : "MISSING");
+            for (int b = 0; b < 16 && b < (int)jpeg_len; b++)
+                printf("%02X ", jpeg_data[b]);
+            printf(" last4=");
+            for (int b = (int)jpeg_len-4; b < (int)jpeg_len && b >= 0; b++)
+                printf("%02X ", jpeg_data[b]);
+            printf("\n");
+            printf("[MJPEG] packet hdr_len=%d jpeg_len=%zu crlf=2 total=%zu\n",
+                   header_len, jpeg_len,
+                   static_cast<size_t>(header_len) + jpeg_len + 2);
         }
-        manager->broadcast_mjpeg_packet(packet);
+        if (!jpeg_soi_ok || !jpeg_eoi_ok) {
+            printf("[MJPEG] WARN invalid JPEG frame #%d SOI=%s EOI=%s first16=",
+                   frame_count,
+                   jpeg_soi_ok ? "OK" : "MISSING",
+                   jpeg_eoi_ok ? "OK" : "MISSING");
+            for (int b = 0; b < 16 && b < (int)jpeg_len; b++)
+                printf("%02X ", jpeg_data[b]);
+            printf("\n");
+        }
     }
 
     return NULL;
