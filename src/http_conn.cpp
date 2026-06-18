@@ -203,6 +203,17 @@ http_conn::PacketQueueResult http_conn::enqueue_packet(
         return PACKET_DROPPED;
     }
 
+    if (droppable) {
+        size_t first_droppable = (m_send_offset > 0) ? 1 : 0;
+        for (size_t i = m_send_queue.size(); i > first_droppable; --i) {
+            size_t index = i - 1;
+            if (m_send_queue[index].droppable) {
+                m_send_queue.erase(m_send_queue.begin() + index);
+                dropped_existing = true;
+            }
+        }
+    }
+
     while (m_send_queue.size() >= max_queue_depth) {
         size_t first_droppable = (m_send_offset > 0) ? 1 : 0;
         size_t drop_index = m_send_queue.size();

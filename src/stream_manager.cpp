@@ -14,7 +14,7 @@
 
 namespace {
 const char* kMjpegBoundary = "frame";
-const size_t kMaxQueueDepthDefault = 10;
+const size_t kMaxQueueDepthDefault = 2;
 const size_t kMaxFlvQueueDepthDefault = 100;
 
 std::string json_escape(const std::string& input) {
