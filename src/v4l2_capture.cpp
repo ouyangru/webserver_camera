@@ -68,6 +68,24 @@ static void publish_frame(const std::vector<unsigned char>& frame,
     pthread_mutex_unlock(&g_frame.lock);
 }
 
+static bool find_jpeg_marker(const unsigned char* data,
+                             size_t len,
+                             size_t from,
+                             unsigned char marker,
+                             size_t& marker_pos) {
+    if (!data || len < 2 || from >= len) {
+        return false;
+    }
+
+    for (size_t i = from; i + 1 < len; ++i) {
+        if (data[i] == 0xFF && data[i + 1] == marker) {
+            marker_pos = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 void* v4l2_thread_func(void* arg) {
     int fd = open(VIDEO_DEV, O_RDWR);
     if (fd < 0) {
@@ -150,10 +168,10 @@ void* v4l2_thread_func(void* arg) {
     printf("[V4L2] Stream ON - 开始实时采集\n");
 
     std::vector<unsigned char> mjpeg_frame;
-    bool has_mjpeg_frame = false;
     uint32_t current_driver_sequence = 0;
     uint64_t dqbuf_count = 0;
     uint64_t dropped_assembled_frames = 0;
+    uint64_t dropped_jpeg_chunks = 0;
 
     while (1) {
         struct v4l2_buffer buf;
@@ -195,43 +213,78 @@ void* v4l2_thread_func(void* arg) {
                     continue;
                 }
 
-                if (has_mjpeg_frame &&
-                    buf.sequence != current_driver_sequence &&
-                    !mjpeg_frame.empty()) {
+                size_t cursor = 0;
+                while (cursor < buf.bytesused) {
+                    if (mjpeg_frame.empty()) {
+                        size_t soi_pos = 0;
+                        if (!find_jpeg_marker(begin, buf.bytesused, cursor,
+                                              0xD8, soi_pos)) {
+                            dropped_jpeg_chunks++;
+                            if (dropped_jpeg_chunks <= 5 ||
+                                dropped_jpeg_chunks % 100 == 0) {
+                                printf("[V4L2] drop MJPEG chunk without SOI "
+                                       "driver_seq=%u bytes=%u dropped=%lu\n",
+                                       buf.sequence,
+                                       buf.bytesused,
+                                       (unsigned long)dropped_jpeg_chunks);
+                            }
+                            break;
+                        }
+                        if (soi_pos > cursor) {
+                            dropped_jpeg_chunks++;
+                            if (dropped_jpeg_chunks <= 5 ||
+                                dropped_jpeg_chunks % 100 == 0) {
+                                printf("[V4L2] skip stale prefix before SOI "
+                                       "driver_seq=%u bytes=%zu dropped=%lu\n",
+                                       buf.sequence,
+                                       soi_pos - cursor,
+                                       (unsigned long)dropped_jpeg_chunks);
+                            }
+                        }
+                        current_driver_sequence = buf.sequence;
+                        cursor = soi_pos;
+                    }
+
+                    size_t eoi_pos = 0;
+                    bool found_eoi = find_jpeg_marker(begin, buf.bytesused,
+                                                      cursor, 0xD9, eoi_pos);
+                    size_t copy_end = found_eoi ? eoi_pos + 2 : buf.bytesused;
+                    size_t copy_len = copy_end - cursor;
+
+                    if (mjpeg_frame.size() + copy_len > MAX_FRAME_SIZE) {
+                        dropped_assembled_frames++;
+                        printf("[V4L2] drop oversized assembled MJPEG "
+                               "driver_seq=%u current=%zu next=%zu dropped=%lu\n",
+                               current_driver_sequence,
+                               mjpeg_frame.size(),
+                               copy_len,
+                               (unsigned long)dropped_assembled_frames);
+                        mjpeg_frame.clear();
+                        break;
+                    }
+
+                    mjpeg_frame.insert(mjpeg_frame.end(),
+                                       begin + cursor,
+                                       begin + copy_end);
+                    cursor = copy_end;
+
+                    if (!found_eoi) {
+                        if (buf.flags & V4L2_BUF_FLAG_LAST) {
+                            dropped_jpeg_chunks++;
+                            printf("[V4L2] drop incomplete MJPEG at LAST "
+                                   "driver_seq=%u assembled=%zu dropped=%lu\n",
+                                   current_driver_sequence,
+                                   mjpeg_frame.size(),
+                                   (unsigned long)dropped_jpeg_chunks);
+                            mjpeg_frame.clear();
+                        }
+                        break;
+                    }
+
                     publish_frame(mjpeg_frame,
                                   fmt.fmt.pix.pixelformat,
                                   current_driver_sequence);
                     mjpeg_frame.clear();
-                    has_mjpeg_frame = false;
-                }
-
-                if (!has_mjpeg_frame) {
-                    current_driver_sequence = buf.sequence;
-                    has_mjpeg_frame = true;
-                }
-
-                if (mjpeg_frame.size() + buf.bytesused > MAX_FRAME_SIZE) {
-                    dropped_assembled_frames++;
-                    printf("[V4L2] drop oversized assembled MJPEG driver_seq=%u "
-                           "current=%zu next=%u dropped=%lu\n",
-                           current_driver_sequence,
-                           mjpeg_frame.size(),
-                           buf.bytesused,
-                           (unsigned long)dropped_assembled_frames);
-                    mjpeg_frame.clear();
-                    has_mjpeg_frame = false;
-                    ioctl(fd, VIDIOC_QBUF, &buf);
-                    continue;
-                }
-
-                mjpeg_frame.insert(mjpeg_frame.end(), begin, begin + buf.bytesused);
-
-                if (buf.flags & V4L2_BUF_FLAG_LAST) {
-                    publish_frame(mjpeg_frame,
-                                  fmt.fmt.pix.pixelformat,
-                                  current_driver_sequence);
-                    mjpeg_frame.clear();
-                    has_mjpeg_frame = false;
                 }
             } else if (buf.bytesused <= MAX_FRAME_SIZE) {
                 std::vector<unsigned char> frame(begin, begin + buf.bytesused);
