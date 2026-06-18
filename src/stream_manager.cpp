@@ -627,20 +627,28 @@ void* mjpeg_stream_thread(void* arg) {
             }
         }
 
-        if (!found_soi || !found_eoi) {
+        if (!found_soi || !found_eoi || jpeg_end <= jpeg_start) {
             static int no_marker_count = 0;
             if (++no_marker_count % 100 == 0) {
-                printf("[MJPEG] SKIP frame: no SOI/EOI in %zu bytes "
-                       "(SOI=%s EOI=%s)\n",
+                printf("[MJPEG] SKIP frame: no valid SOI/EOI in %zu bytes "
+                       "(SOI=%s at=%zu EOI=%s at=%zu)\n",
                        raw_len,
-                       found_soi ? "found" : "missing",
-                       found_eoi ? "found" : "missing");
+                       found_soi ? "found" : "missing", jpeg_start,
+                       found_eoi ? "found" : "missing", jpeg_end);
             }
             pthread_mutex_unlock(&g_frame.lock);
             continue;
         }
 
         size_t jpeg_len = jpeg_end - jpeg_start;
+        
+        // 二次校验：jpeg_len 不能超过 raw_len
+        if (jpeg_len > raw_len || jpeg_len < 2) {
+            printf("[MJPEG] SKIP frame: absurd jpeg_len=%zu raw=%zu start=%zu end=%zu\n",
+                   jpeg_len, raw_len, jpeg_start, jpeg_end);
+            pthread_mutex_unlock(&g_frame.lock);
+            continue;
+        }
         unsigned char* jpeg_data_start = raw_data + jpeg_start;
         
         // 仍用锁保护，打印诊断
