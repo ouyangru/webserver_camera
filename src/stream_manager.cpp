@@ -599,60 +599,99 @@ void* mjpeg_stream_thread(void* arg) {
             pthread_mutex_unlock(&g_frame.lock);
             continue;
         }
-        size_t len = g_frame.length;
+
+        // 搜索真正的 JPEG 边界（SOI=0xFFD8 和 EOI=0xFFD9）
+        // 因为某些 V4L2 摄像头在 JPEG 数据前可能插入厂商自定义头
+        size_t raw_len = g_frame.length;
+        unsigned char* raw_data = g_frame.data;
+
+        // 从前往后找 SOI
+        size_t jpeg_start = 0;
+        bool found_soi = false;
+        for (size_t i = 0; i + 1 < raw_len; i++) {
+            if (raw_data[i] == 0xFF && raw_data[i+1] == 0xD8) {
+                jpeg_start = i;
+                found_soi = true;
+                break;
+            }
+        }
+
+        // 从后往前找 EOI
+        size_t jpeg_end = raw_len;
+        bool found_eoi = false;
+        for (size_t i = raw_len; i >= 2; i--) {
+            if (raw_data[i-2] == 0xFF && raw_data[i-1] == 0xD9) {
+                jpeg_end = i;
+                found_eoi = true;
+                break;
+            }
+        }
+
+        if (!found_soi || !found_eoi) {
+            static int no_marker_count = 0;
+            if (++no_marker_count % 100 == 0) {
+                printf("[MJPEG] SKIP frame: no SOI/EOI in %zu bytes "
+                       "(SOI=%s EOI=%s)\n",
+                       raw_len,
+                       found_soi ? "found" : "missing",
+                       found_eoi ? "found" : "missing");
+            }
+            pthread_mutex_unlock(&g_frame.lock);
+            continue;
+        }
+
+        size_t jpeg_len = jpeg_end - jpeg_start;
+        unsigned char* jpeg_data_start = raw_data + jpeg_start;
+        
+        // 仍用锁保护，打印诊断
+        int jpeg_soi_ok = (jpeg_data_start[0] == 0xFF && jpeg_data_start[1] == 0xD8);
+        int jpeg_eoi_ok = (jpeg_data_start[jpeg_len-2] == 0xFF && jpeg_data_start[jpeg_len-1] == 0xD9);
 
         char header_buf[128];
         int header_len = snprintf(header_buf, sizeof(header_buf),
                                   "--%s\r\n"
                                   "Content-Type: image/jpeg\r\n"
                                   "Content-Length: %zu\r\n\r\n",
-                                  kMjpegBoundary, len);
+                                  kMjpegBoundary, jpeg_len);
         if (header_len <= 0) {
             pthread_mutex_unlock(&g_frame.lock);
             continue;
         }
 
-        size_t packet_len = static_cast<size_t>(header_len) + len + 2;
+        size_t packet_len = static_cast<size_t>(header_len) + jpeg_len + 2;
         std::shared_ptr<std::vector<unsigned char>> packet =
             std::make_shared<std::vector<unsigned char>>(packet_len);
 
         memcpy(packet->data(), header_buf, static_cast<size_t>(header_len));
-        memcpy(packet->data() + header_len, g_frame.data, len);
-        memcpy(packet->data() + header_len + len, "\r\n", 2);
-
-        // 诊断日志：在锁内验证 JPEG 数据完整性（用 packet 中的拷贝，避免竞争）
-        unsigned char* jpeg_data = packet->data() + header_len;
-        size_t jpeg_len = len;
-        int jpeg_soi_ok = (jpeg_len >= 2 && jpeg_data[0] == 0xFF && jpeg_data[1] == 0xD8);
-        int jpeg_eoi_ok = (jpeg_len >= 2 && jpeg_data[jpeg_len-2] == 0xFF && jpeg_data[jpeg_len-1] == 0xD9);
+        memcpy(packet->data() + header_len, jpeg_data_start, jpeg_len);
+        memcpy(packet->data() + header_len + jpeg_len, "\r\n", 2);
         
         pthread_mutex_unlock(&g_frame.lock);
 
         frame_count++;
         if (frame_count <= 5 || frame_count % 50 == 0) {
-            printf("[MJPEG] frame #%d seq=%lu jpeg_size=%zu SOI=%s EOI=%s first16=",
-                   frame_count, (unsigned long)last_sequence, jpeg_len,
+            printf("[MJPEG] frame #%d seq=%lu raw=%zu jpeg=%zu (offset=%zu) SOI=%s EOI=%s first16=",
+                   frame_count, (unsigned long)last_sequence,
+                   raw_len, jpeg_len, jpeg_start,
                    jpeg_soi_ok ? "OK" : "MISSING",
                    jpeg_eoi_ok ? "OK" : "MISSING");
-            for (int b = 0; b < 16 && b < (int)jpeg_len; b++)
-                printf("%02X ", jpeg_data[b]);
+            for (size_t b = 0; b < 16 && b < jpeg_len; b++)
+                printf("%02X ", jpeg_data_start[b]);
             printf(" last4=");
-            for (int b = (int)jpeg_len-4; b < (int)jpeg_len && b >= 0; b++)
-                printf("%02X ", jpeg_data[b]);
+            for (size_t b = jpeg_len > 4 ? jpeg_len - 4 : 0; b < jpeg_len; b++)
+                printf("%02X ", jpeg_data_start[b]);
             printf("\n");
-            printf("[MJPEG] packet hdr_len=%d jpeg_len=%zu crlf=2 total=%zu\n",
-                   header_len, jpeg_len,
-                   static_cast<size_t>(header_len) + jpeg_len + 2);
         }
         if (!jpeg_soi_ok || !jpeg_eoi_ok) {
             printf("[MJPEG] WARN invalid JPEG frame #%d SOI=%s EOI=%s first16=",
                    frame_count,
                    jpeg_soi_ok ? "OK" : "MISSING",
                    jpeg_eoi_ok ? "OK" : "MISSING");
-            for (int b = 0; b < 16 && b < (int)jpeg_len; b++)
-                printf("%02X ", jpeg_data[b]);
+            for (size_t b = 0; b < 16 && b < jpeg_len; b++)
+                printf("%02X ", jpeg_data_start[b]);
             printf("\n");
         }
+        manager->broadcast_mjpeg_packet(packet);
     }
 
     return NULL;
