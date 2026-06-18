@@ -587,6 +587,13 @@ void* mjpeg_stream_thread(void* arg) {
     printf("[MJPEG] broadcast thread started\n");
     uint64_t last_sequence = 0;
     int frame_count = 0;
+    
+    // FIFO 缓冲区：跨 DQBUF 边界拼接不完整的帧
+    // V4L2 DQBUF 的边界不一定与 JPEG SOI/EOI 对齐
+    std::vector<unsigned char> fifo;
+    const size_t kMaxFifoSize = 4 * 1024 * 1024;  // 4MB 上限防止内存泄漏
+    size_t fifo_discard_total = 0;  // 统计丢弃的字节数
+    
     while (true) {
         pthread_mutex_lock(&g_frame.lock);
         while (g_frame.sequence == last_sequence) {
@@ -599,107 +606,109 @@ void* mjpeg_stream_thread(void* arg) {
             pthread_mutex_unlock(&g_frame.lock);
             continue;
         }
-
-        // 搜索真正的 JPEG 边界（SOI=0xFFD8 和 EOI=0xFFD9）
-        // 因为某些 V4L2 摄像头在 JPEG 数据前可能插入厂商自定义头
+        
         size_t raw_len = g_frame.length;
         unsigned char* raw_data = g_frame.data;
 
-        // 从前往后找 SOI
-        size_t jpeg_start = 0;
-        bool found_soi = false;
-        for (size_t i = 0; i + 1 < raw_len; i++) {
-            if (raw_data[i] == 0xFF && raw_data[i+1] == 0xD8) {
-                jpeg_start = i;
-                found_soi = true;
-                break;
-            }
-        }
-
-        // 从后往前找 EOI
-        size_t jpeg_end = raw_len;
-        bool found_eoi = false;
-        for (size_t i = raw_len; i >= 2; i--) {
-            if (raw_data[i-2] == 0xFF && raw_data[i-1] == 0xD9) {
-                jpeg_end = i;
-                found_eoi = true;
-                break;
-            }
-        }
-
-        if (!found_soi || !found_eoi || jpeg_end <= jpeg_start) {
-            static int no_marker_count = 0;
-            if (++no_marker_count % 100 == 0) {
-                printf("[MJPEG] SKIP frame: no valid SOI/EOI in %zu bytes "
-                       "(SOI=%s at=%zu EOI=%s at=%zu)\n",
-                       raw_len,
-                       found_soi ? "found" : "missing", jpeg_start,
-                       found_eoi ? "found" : "missing", jpeg_end);
-            }
-            pthread_mutex_unlock(&g_frame.lock);
-            continue;
-        }
-
-        size_t jpeg_len = jpeg_end - jpeg_start;
-        
-        // 二次校验：jpeg_len 不能超过 raw_len
-        if (jpeg_len > raw_len || jpeg_len < 2) {
-            printf("[MJPEG] SKIP frame: absurd jpeg_len=%zu raw=%zu start=%zu end=%zu\n",
-                   jpeg_len, raw_len, jpeg_start, jpeg_end);
-            pthread_mutex_unlock(&g_frame.lock);
-            continue;
-        }
-        unsigned char* jpeg_data_start = raw_data + jpeg_start;
-        
-        // 仍用锁保护，打印诊断
-        int jpeg_soi_ok = (jpeg_data_start[0] == 0xFF && jpeg_data_start[1] == 0xD8);
-        int jpeg_eoi_ok = (jpeg_data_start[jpeg_len-2] == 0xFF && jpeg_data_start[jpeg_len-1] == 0xD9);
-
-        char header_buf[128];
-        int header_len = snprintf(header_buf, sizeof(header_buf),
-                                  "--%s\r\n"
-                                  "Content-Type: image/jpeg\r\n"
-                                  "Content-Length: %zu\r\n\r\n",
-                                  kMjpegBoundary, jpeg_len);
-        if (header_len <= 0) {
-            pthread_mutex_unlock(&g_frame.lock);
-            continue;
-        }
-
-        size_t packet_len = static_cast<size_t>(header_len) + jpeg_len + 2;
-        std::shared_ptr<std::vector<unsigned char>> packet =
-            std::make_shared<std::vector<unsigned char>>(packet_len);
-
-        memcpy(packet->data(), header_buf, static_cast<size_t>(header_len));
-        memcpy(packet->data() + header_len, jpeg_data_start, jpeg_len);
-        memcpy(packet->data() + header_len + jpeg_len, "\r\n", 2);
-        
+        // 追加到 FIFO 缓冲区
+        fifo.insert(fifo.end(), raw_data, raw_data + raw_len);
         pthread_mutex_unlock(&g_frame.lock);
+        
+        // 防止 FIFO 无限增长：超过上限时丢弃前半部分
+        if (fifo.size() > kMaxFifoSize) {
+            size_t discard = fifo.size() / 2;
+            fifo_discard_total += discard;
+            fifo.erase(fifo.begin(), fifo.begin() + static_cast<long>(discard));
+            printf("[MJPEG] FIFO overflow, discarded %zu bytes (total=%zu)\n",
+                   discard, fifo_discard_total);
+        }
+        
+        // 从 FIFO 中提取所有完整的 SOI...EOI 帧
+        while (true) {
+            if (fifo.size() < 4) break;  // 至少需要 SOI(2) + EOI(2)
+            
+            unsigned char* buf = fifo.data();
+            size_t buf_len = fifo.size();
+            
+            // 找 SOI — 如果当前 buf 不以 SOI 开头，跳过前面非 JPEG 数据
+            if (!(buf[0] == 0xFF && buf[1] == 0xD8)) {
+                bool found = false;
+                size_t soi_pos = 0;
+                for (size_t i = 0; i + 1 < buf_len; i++) {
+                    if (buf[i] == 0xFF && buf[i+1] == 0xD8) {
+                        soi_pos = i;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    // 没有 SOI：清空缓冲区（这些数据没有用）
+                    if (buf_len > 256) {
+                        printf("[MJPEG] FIFO discard %zu bytes (no SOI found)\n", buf_len);
+                    }
+                    fifo.clear();
+                    break;
+                }
+                // 跳过 SOI 之前的数据
+                fifo.erase(fifo.begin(), fifo.begin() + static_cast<long>(soi_pos));
+                buf = fifo.data();
+                buf_len = fifo.size();
+            }
+            
+            // 现在 buf 以 SOI 开头，从 SOI 之后找 EOI
+            if (buf_len < 4) break;
+            
+            bool found_eoi = false;
+            size_t eoi_pos = 0;  // EOI 结束后位置（即最后一个 EOI 字节的下一个位置）
+            // 从后往前找 EOI，但要确保 EOI 在 SOI 之后
+            for (size_t i = buf_len; i >= 2; i--) {
+                if (buf[i-2] == 0xFF && buf[i-1] == 0xD9) {
+                    eoi_pos = i;
+                    found_eoi = true;
+                    break;
+                }
+            }
+            
+            if (!found_eoi) {
+                // 有 SOI 但还没收到 EOI — 等下一次 DQBUF
+                break;
+            }
+            
+            // 提取完整的 SOI...EOI 帧
+            size_t jpeg_len = eoi_pos;  // SOI 在 buf[0]，EOI 在 buf[eoi_pos-1]
+            
+            // 构造 multipart 包
+            char header_buf[128];
+            int header_len = snprintf(header_buf, sizeof(header_buf),
+                                      "--%s\r\n"
+                                      "Content-Type: image/jpeg\r\n"
+                                      "Content-Length: %zu\r\n\r\n",
+                                      kMjpegBoundary, jpeg_len);
+            if (header_len <= 0) {
+                fifo.erase(fifo.begin(), fifo.begin() + static_cast<long>(eoi_pos));
+                continue;
+            }
 
-        frame_count++;
-        if (frame_count <= 5 || frame_count % 50 == 0) {
-            printf("[MJPEG] frame #%d seq=%lu raw=%zu jpeg=%zu (offset=%zu) SOI=%s EOI=%s first16=",
-                   frame_count, (unsigned long)last_sequence,
-                   raw_len, jpeg_len, jpeg_start,
-                   jpeg_soi_ok ? "OK" : "MISSING",
-                   jpeg_eoi_ok ? "OK" : "MISSING");
-            for (size_t b = 0; b < 16 && b < jpeg_len; b++)
-                printf("%02X ", jpeg_data_start[b]);
-            printf(" last4=");
-            for (size_t b = jpeg_len > 4 ? jpeg_len - 4 : 0; b < jpeg_len; b++)
-                printf("%02X ", jpeg_data_start[b]);
-            printf("\n");
+            size_t packet_len = static_cast<size_t>(header_len) + jpeg_len + 2;
+            std::shared_ptr<std::vector<unsigned char>> packet =
+                std::make_shared<std::vector<unsigned char>>(packet_len);
+
+            memcpy(packet->data(), header_buf, static_cast<size_t>(header_len));
+            memcpy(packet->data() + header_len, buf, jpeg_len);
+            memcpy(packet->data() + header_len + jpeg_len, "\r\n", 2);
+
+            frame_count++;
+            if (frame_count <= 5 || frame_count % 50 == 0) {
+                printf("[MJPEG] frame #%d seq=%lu jpeg=%zu fifo=%zu SOI=OK EOI=OK\n",
+                       frame_count, (unsigned long)last_sequence,
+                       jpeg_len, fifo.size());
+            }
+
+            manager->broadcast_mjpeg_packet(packet);
+
+            // 从 FIFO 中移除已提取的帧
+            fifo.erase(fifo.begin(), fifo.begin() + static_cast<long>(eoi_pos));
         }
-        if (!jpeg_soi_ok || !jpeg_eoi_ok) {
-            printf("[MJPEG] WARN invalid JPEG frame #%d SOI=%s EOI=%s first16=",
-                   frame_count,
-                   jpeg_soi_ok ? "OK" : "MISSING",
-                   jpeg_eoi_ok ? "OK" : "MISSING");
-            for (size_t b = 0; b < 16 && b < jpeg_len; b++)
-                printf("%02X ", jpeg_data_start[b]);
-            printf("\n");
-        }
-        manager->broadcast_mjpeg_packet(packet);
     }
 
     return NULL;
