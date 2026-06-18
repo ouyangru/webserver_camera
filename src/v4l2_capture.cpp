@@ -7,6 +7,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
+#include <vector>
 #include "v4l2_capture.h"
 #include "shared_buffer.h"
 
@@ -43,6 +44,28 @@ static void print_supported_formats(int fd) {
         fourcc_to_string(desc.pixelformat, fourcc);
         printf("[V4L2]   %s - %s\n", fourcc, desc.description);
     }
+}
+
+static void publish_frame(const std::vector<unsigned char>& frame,
+                          uint32_t pixel_format,
+                          uint32_t driver_sequence) {
+    if (frame.empty() || frame.size() > MAX_FRAME_SIZE) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_frame.lock);
+    memcpy(g_frame.data, frame.data(), frame.size());
+    g_frame.length = frame.size();
+    g_frame.pixel_format = static_cast<int>(pixel_format);
+    g_frame.sequence++;
+    if (g_frame.sequence <= 5 || g_frame.sequence % 100 == 0) {
+        printf("[V4L2] publish frame app_seq=%lu driver_seq=%u bytes=%zu\n",
+               (unsigned long)g_frame.sequence,
+               driver_sequence,
+               frame.size());
+    }
+    pthread_cond_broadcast(&g_frame.cond_new_frame);
+    pthread_mutex_unlock(&g_frame.lock);
 }
 
 void* v4l2_thread_func(void* arg) {
@@ -126,24 +149,94 @@ void* v4l2_thread_func(void* arg) {
     }
     printf("[V4L2] Stream ON - 开始实时采集\n");
 
+    std::vector<unsigned char> mjpeg_frame;
+    bool has_mjpeg_frame = false;
+    uint32_t current_driver_sequence = 0;
+    uint64_t dqbuf_count = 0;
+    uint64_t dropped_assembled_frames = 0;
+
     while (1) {
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
         if (ioctl(fd, VIDIOC_DQBUF, &buf) == 0) {
-            pthread_mutex_lock(&g_frame.lock);
-            if (buf.bytesused <= MAX_FRAME_SIZE) {
-                memcpy(g_frame.data, buffers[buf.index].start, buf.bytesused);
-                g_frame.length = buf.bytesused;
-                g_frame.sequence++;
-                if (g_frame.sequence <= 3) {
-                    printf("[V4L2] captured frame #%lu, bytes=%d\n",
-                           (unsigned long)g_frame.sequence, buf.bytesused);
-                }
-                pthread_cond_broadcast(&g_frame.cond_new_frame);
+            dqbuf_count++;
+            if (buf.index >= V4L2_BUFFER_COUNT) {
+                fprintf(stderr, "[V4L2] invalid buffer index=%u\n", buf.index);
+                ioctl(fd, VIDIOC_QBUF, &buf);
+                continue;
             }
-            pthread_mutex_unlock(&g_frame.lock);
+
+            const unsigned char* begin =
+                static_cast<const unsigned char*>(buffers[buf.index].start);
+
+            if (dqbuf_count <= 10 || dqbuf_count % 200 == 0) {
+                unsigned int first0 = buf.bytesused > 0 ? begin[0] : 0;
+                unsigned int first1 = buf.bytesused > 1 ? begin[1] : 0;
+                unsigned int last0 = buf.bytesused > 1 ? begin[buf.bytesused - 2] : 0;
+                unsigned int last1 = buf.bytesused > 0 ? begin[buf.bytesused - 1] : 0;
+                printf("[V4L2] dqbuf=%lu driver_seq=%u index=%u bytes=%u flags=0x%x "
+                       "first=%02X%02X last=%02X%02X\n",
+                       (unsigned long)dqbuf_count,
+                       buf.sequence,
+                       buf.index,
+                       buf.bytesused,
+                       buf.flags,
+                       first0,
+                       first1,
+                       last0,
+                       last1);
+            }
+
+            if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG) {
+                if (buf.bytesused == 0) {
+                    ioctl(fd, VIDIOC_QBUF, &buf);
+                    continue;
+                }
+
+                if (has_mjpeg_frame &&
+                    buf.sequence != current_driver_sequence &&
+                    !mjpeg_frame.empty()) {
+                    publish_frame(mjpeg_frame,
+                                  fmt.fmt.pix.pixelformat,
+                                  current_driver_sequence);
+                    mjpeg_frame.clear();
+                    has_mjpeg_frame = false;
+                }
+
+                if (!has_mjpeg_frame) {
+                    current_driver_sequence = buf.sequence;
+                    has_mjpeg_frame = true;
+                }
+
+                if (mjpeg_frame.size() + buf.bytesused > MAX_FRAME_SIZE) {
+                    dropped_assembled_frames++;
+                    printf("[V4L2] drop oversized assembled MJPEG driver_seq=%u "
+                           "current=%zu next=%u dropped=%lu\n",
+                           current_driver_sequence,
+                           mjpeg_frame.size(),
+                           buf.bytesused,
+                           (unsigned long)dropped_assembled_frames);
+                    mjpeg_frame.clear();
+                    has_mjpeg_frame = false;
+                    ioctl(fd, VIDIOC_QBUF, &buf);
+                    continue;
+                }
+
+                mjpeg_frame.insert(mjpeg_frame.end(), begin, begin + buf.bytesused);
+
+                if (buf.flags & V4L2_BUF_FLAG_LAST) {
+                    publish_frame(mjpeg_frame,
+                                  fmt.fmt.pix.pixelformat,
+                                  current_driver_sequence);
+                    mjpeg_frame.clear();
+                    has_mjpeg_frame = false;
+                }
+            } else if (buf.bytesused <= MAX_FRAME_SIZE) {
+                std::vector<unsigned char> frame(begin, begin + buf.bytesused);
+                publish_frame(frame, fmt.fmt.pix.pixelformat, buf.sequence);
+            }
 
             ioctl(fd, VIDIOC_QBUF, &buf);
         } else {
