@@ -587,10 +587,12 @@ void* mjpeg_stream_thread(void* arg) {
     printf("[MJPEG] broadcast thread started\n");
     uint64_t last_sequence = 0;
     int frame_count = 0;
-    uint64_t invalid_frame_count = 0;
+    uint64_t dropped_chunk_count = 0;
+    std::vector<unsigned char> assembling;
+    const size_t kMaxAssemblingSize = 4 * 1024 * 1024;
     
     while (true) {
-        std::vector<unsigned char> frame;
+        std::vector<unsigned char> chunk;
         uint64_t sequence = 0;
 
         pthread_mutex_lock(&g_frame.lock);
@@ -606,76 +608,105 @@ void* mjpeg_stream_thread(void* arg) {
             continue;
         }
 
-        frame.assign(g_frame.data, g_frame.data + g_frame.length);
+        chunk.assign(g_frame.data, g_frame.data + g_frame.length);
         pthread_mutex_unlock(&g_frame.lock);
 
-        if (frame.size() < 4) {
-            ++invalid_frame_count;
+        if (chunk.size() < 2) {
+            ++dropped_chunk_count;
             continue;
         }
 
-        size_t soi_pos = 0;
-        bool found_soi = false;
-        for (size_t i = 0; i + 1 < frame.size(); ++i) {
-            if (frame[i] == 0xFF && frame[i + 1] == 0xD8) {
-                soi_pos = i;
-                found_soi = true;
+        size_t cursor = 0;
+        while (cursor < chunk.size()) {
+            if (assembling.empty()) {
+                size_t soi_pos = chunk.size();
+                for (size_t i = cursor; i + 1 < chunk.size(); ++i) {
+                    if (chunk[i] == 0xFF && chunk[i + 1] == 0xD8) {
+                        soi_pos = i;
+                        break;
+                    }
+                }
+
+                if (soi_pos == chunk.size()) {
+                    ++dropped_chunk_count;
+                    if (dropped_chunk_count <= 5 ||
+                        dropped_chunk_count % 100 == 0) {
+                        printf("[MJPEG] drop chunk without SOI seq=%lu bytes=%zu dropped=%llu\n",
+                               (unsigned long)sequence, chunk.size() - cursor,
+                               (unsigned long long)dropped_chunk_count);
+                    }
+                    break;
+                }
+
+                if (soi_pos > cursor) {
+                    ++dropped_chunk_count;
+                    if (dropped_chunk_count <= 5 ||
+                        dropped_chunk_count % 100 == 0) {
+                        printf("[MJPEG] skip prefix before SOI seq=%lu bytes=%zu dropped=%llu\n",
+                               (unsigned long)sequence, soi_pos - cursor,
+                               (unsigned long long)dropped_chunk_count);
+                    }
+                }
+                cursor = soi_pos;
+            }
+
+            size_t eoi_pos = chunk.size();
+            bool found_eoi = false;
+            for (size_t i = cursor; i + 1 < chunk.size(); ++i) {
+                if (chunk[i] == 0xFF && chunk[i + 1] == 0xD9) {
+                    eoi_pos = i + 2;
+                    found_eoi = true;
+                    break;
+                }
+            }
+
+            assembling.insert(assembling.end(),
+                              chunk.begin() + static_cast<long>(cursor),
+                              chunk.begin() + static_cast<long>(eoi_pos));
+            cursor = eoi_pos;
+
+            if (assembling.size() > kMaxAssemblingSize) {
+                printf("[MJPEG] assembling overflow seq=%lu bytes=%zu, reset current JPEG\n",
+                       (unsigned long)sequence, assembling.size());
+                assembling.clear();
+                ++dropped_chunk_count;
+                continue;
+            }
+
+            if (!found_eoi) {
                 break;
             }
-        }
 
-        size_t eoi_pos = 0;
-        bool found_eoi = false;
-        for (size_t i = frame.size(); i >= soi_pos + 4; --i) {
-            if (frame[i - 2] == 0xFF && frame[i - 1] == 0xD9) {
-                eoi_pos = i;
-                found_eoi = true;
-                break;
+            size_t jpeg_len = assembling.size();
+            char header_buf[128];
+            int header_len = snprintf(header_buf, sizeof(header_buf),
+                                      "--%s\r\n"
+                                      "Content-Type: image/jpeg\r\n"
+                                      "Content-Length: %zu\r\n\r\n",
+                                      kMjpegBoundary, jpeg_len);
+            if (header_len <= 0) {
+                assembling.clear();
+                continue;
             }
-        }
 
-        if (!found_soi || !found_eoi || eoi_pos <= soi_pos + 2) {
-            ++invalid_frame_count;
-            if (invalid_frame_count <= 5 || invalid_frame_count % 100 == 0) {
-                printf("[MJPEG] drop invalid frame seq=%lu bytes=%zu "
-                       "SOI=%s EOI=%s invalid=%llu\n",
-                       (unsigned long)sequence, frame.size(),
-                       found_soi ? "yes" : "no",
-                       found_eoi ? "yes" : "no",
-                       (unsigned long long)invalid_frame_count);
+            size_t packet_len = static_cast<size_t>(header_len) + jpeg_len + 2;
+            std::shared_ptr<std::vector<unsigned char>> packet =
+                std::make_shared<std::vector<unsigned char>>(packet_len);
+
+            memcpy(packet->data(), header_buf, static_cast<size_t>(header_len));
+            memcpy(packet->data() + header_len, assembling.data(), jpeg_len);
+            memcpy(packet->data() + header_len + jpeg_len, "\r\n", 2);
+
+            frame_count++;
+            if (frame_count <= 5 || frame_count % 50 == 0) {
+                printf("[MJPEG] frame #%d seq=%lu jpeg=%zu chunk=%zu pending_tail=%zu\n",
+                       frame_count, (unsigned long)sequence, jpeg_len,
+                       chunk.size(), chunk.size() - cursor);
             }
-            continue;
+
+            manager->broadcast_mjpeg_packet(packet);
+            assembling.clear();
         }
-
-        const unsigned char* jpeg_data = frame.data() + soi_pos;
-        size_t jpeg_len = eoi_pos - soi_pos;
-
-        char header_buf[128];
-        int header_len = snprintf(header_buf, sizeof(header_buf),
-                                  "--%s\r\n"
-                                  "Content-Type: image/jpeg\r\n"
-                                  "Content-Length: %zu\r\n\r\n",
-                                  kMjpegBoundary, jpeg_len);
-        if (header_len <= 0) {
-            continue;
-        }
-
-        size_t packet_len = static_cast<size_t>(header_len) + jpeg_len + 2;
-        std::shared_ptr<std::vector<unsigned char>> packet =
-            std::make_shared<std::vector<unsigned char>>(packet_len);
-
-        memcpy(packet->data(), header_buf, static_cast<size_t>(header_len));
-        memcpy(packet->data() + header_len, jpeg_data, jpeg_len);
-        memcpy(packet->data() + header_len + jpeg_len, "\r\n", 2);
-
-        frame_count++;
-        if (frame_count <= 5 || frame_count % 50 == 0) {
-            printf("[MJPEG] frame #%d seq=%lu raw=%zu jpeg=%zu trim_head=%zu trim_tail=%zu\n",
-                   frame_count, (unsigned long)sequence, frame.size(), jpeg_len,
-                   soi_pos, frame.size() - eoi_pos);
-        }
-
-        manager->broadcast_mjpeg_packet(packet);
     }
 
     return NULL;
