@@ -156,6 +156,7 @@
       .shell { grid-template-columns: 1fr; }
     }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.11"></script>
 </head>
 <body>
@@ -170,20 +171,26 @@
       </header>
       <video id="video" controls autoplay muted playsinline></video>
       <div class="controls">
+        <select id="modeInput">
+          <option value="flv">HTTP-FLV</option>
+          <option value="hls">HLS</option>
+        </select>
         <input id="urlInput" type="text" value="/hls/stream.m3u8" />
         <button id="playBtn">Play</button>
         <button id="stopBtn">Stop</button>
       </div>
 
       <div class="list">
-        <div class="pill">Tip: use /hls/stream.m3u8 for browser playback.</div>
+        <div class="pill">HTTP-FLV uses flv.js and /live.flv.</div>
+        <div class="pill">HLS uses hls.js or native Safari playback.</div>
       </div>
     </div>
 
     <div class="card right">
       <h2>System Notes</h2>
       <div class="list">
-        <div>HLS uses small segments for compatibility and lower latency.</div>
+        <div>HTTP-FLV has lower latency, but needs MediaSource Extensions and flv.js.</div>
+        <div>HLS uses small segments for broader compatibility.</div>
         <div>RTSP is not supported directly by browsers.</div>
       </div>
       <div class="kpi">
@@ -202,6 +209,7 @@
 
   <script>
     const video = document.getElementById('video');
+    const modeInput = document.getElementById('modeInput');
     const urlInput = document.getElementById('urlInput');
     const playBtn = document.getElementById('playBtn');
     const stopBtn = document.getElementById('stopBtn');
@@ -211,6 +219,7 @@
     const urlValue = document.getElementById('urlValue');
 
     let hls = null;
+    let flv = null;
 
     function setStatus(ok, text) {
       statusDot.classList.toggle('ok', ok);
@@ -218,6 +227,15 @@
     }
 
     function stopAll() {
+      if (flv) {
+        try {
+          flv.pause();
+          flv.unload();
+          flv.detachMediaElement();
+          flv.destroy();
+        } catch (e) {}
+        flv = null;
+      }
       if (hls) {
         hls.destroy();
         hls = null;
@@ -226,6 +244,39 @@
       video.removeAttribute('src');
       video.style.display = 'none';
       setStatus(false, 'Stopped');
+    }
+
+    function playFlv(url) {
+      video.style.display = 'block';
+      if (typeof window.flvjs === 'undefined' || !flvjs.isSupported()) {
+        setStatus(false, 'HTTP-FLV unsupported');
+        return;
+      }
+      if (flvjs.getFeatureList) {
+        const features = flvjs.getFeatureList();
+        if (features && features.mseLiveFlvPlayback === false) {
+          setStatus(false, 'Live FLV unsupported');
+          return;
+        }
+      }
+      flv = flvjs.createPlayer({
+        type: 'flv',
+        url,
+        isLive: true,
+        hasAudio: false,
+        hasVideo: true
+      }, {
+        enableStashBuffer: false,
+        lazyLoad: false,
+        deferLoadAfterSourceOpen: false
+      });
+      flv.attachMediaElement(video);
+      flv.load();
+      flv.play().catch(() => {});
+      flv.on(flvjs.Events.ERROR, (type, detail) => {
+        setStatus(false, 'FLV error: ' + type + (detail ? '/' + detail : ''));
+      });
+      setStatus(true, 'HTTP-FLV (flv.js)');
     }
 
     function playHls(url) {
@@ -258,15 +309,27 @@
 
     playBtn.addEventListener('click', () => {
       stopAll();
+      const mode = modeInput.value;
       const url = urlInput.value.trim();
-      modeValue.textContent = 'HLS';
+      modeValue.textContent = mode.toUpperCase();
       urlValue.textContent = url;
-      playHls(url);
+      if (mode === 'flv') {
+        playFlv(url);
+      } else {
+        playHls(url);
+      }
     });
 
     stopBtn.addEventListener('click', () => stopAll());
 
-    // Auto start HLS
+    modeInput.addEventListener('change', () => {
+      urlInput.value = modeInput.value === 'flv'
+        ? '/live.flv'
+        : '/hls/stream.m3u8';
+    });
+
+    modeInput.value = 'flv';
+    urlInput.value = '/live.flv';
     playBtn.click();
   </script>
 </body>

@@ -423,6 +423,7 @@
   let hlsPlayer = null;
   let statusInterval = null;
   let clockInterval = null;
+  let flvRecoverTimer = null;
   let startTime = Date.now();
 
   // MJPEG: 浏览器原生支持 img src 解析 multipart/x-mixed-replace
@@ -496,6 +497,16 @@
       try { flvPlayer.pause(); flvPlayer.unload(); flvPlayer.detachMediaElement(); flvPlayer.destroy(); } catch(e) {}
       flvPlayer = null;
     }
+    if (flvRecoverTimer) {
+      clearTimeout(flvRecoverTimer);
+      flvRecoverTimer = null;
+    }
+    const flvVideo = document.getElementById('flvView');
+    if (flvVideo) {
+      flvVideo.pause();
+      flvVideo.removeAttribute('src');
+      flvVideo.load();
+    }
     // HLS
     if (hlsPlayer) {
       try { hlsPlayer.destroy(); } catch(e) {}
@@ -504,10 +515,30 @@
   }
 
   // ---- FLV Player ----
+  function getFlvSupportReason() {
+    if (typeof window.flvjs === 'undefined') {
+      return 'flv.js script is not loaded. Check network access to the CDN or bundle flv.min.js locally.';
+    }
+    if (!window.MediaSource) {
+      return 'MediaSource Extensions are not available in this browser.';
+    }
+    if (!flvjs.isSupported()) {
+      return 'flv.js reports that this browser is not supported.';
+    }
+    if (flvjs.getFeatureList) {
+      const features = flvjs.getFeatureList();
+      if (features && features.mseLiveFlvPlayback === false) {
+        return 'This browser does not support live HTTP-FLV playback through MSE.';
+      }
+    }
+    return '';
+  }
+
   function startFlvPlayer() {
-    if (!flvjs || !flvjs.isSupported()) {
-      showPlaceholder('Your browser does not support FLV playback (flv.js).');
-      log('flv.js not supported in this browser', 'err');
+    const unsupported = getFlvSupportReason();
+    if (unsupported) {
+      showPlaceholder('HTTP-FLV playback unavailable: ' + unsupported);
+      log('HTTP-FLV unsupported: ' + unsupported, 'err');
       return;
     }
     const video = document.getElementById('flvView');
@@ -517,14 +548,28 @@
     }, {
       enableStashBuffer: false,
       stashInitialSize: 128,
+      lazyLoad: false,
+      deferLoadAfterSourceOpen: false,
       autoCleanupSourceBuffer: true,
     });
     flvPlayer.attachMediaElement(video);
     flvPlayer.load();
-    flvPlayer.play().catch(() => {});
-    flvPlayer.on(flvjs.Events.ERROR, (e) => {
-      log('FLV player error: ' + e, 'err');
-      toast('FLV stream error', 'error');
+    flvPlayer.play().catch((err) => {
+      log('FLV autoplay blocked or delayed: ' + err.message, 'err');
+    });
+    flvPlayer.on(flvjs.Events.ERROR, (type, detail, info) => {
+      const message = type + (detail ? '/' + detail : '');
+      log('FLV player error: ' + message, 'err');
+      toast('FLV stream error: ' + message, 'error');
+      if (!flvRecoverTimer && currentTab === 'flv') {
+        flvRecoverTimer = setTimeout(() => {
+          flvRecoverTimer = null;
+          if (currentTab === 'flv') {
+            log('Retrying HTTP-FLV stream...', 'info');
+            switchTab('flv');
+          }
+        }, 2000);
+      }
     });
     flvPlayer.on(flvjs.Events.LOADING_COMPLETE, () => {
       log('FLV loading complete', 'info');
@@ -649,7 +694,7 @@
       const flv = streams.flv || {};
 
       // MJPEG
-      const mjpegReady = mjpeg.source_ready || false;
+      const mjpegReady = mjpeg.source_ready || mjpeg.ready || false;
       const mjpegEl = document.getElementById('kpiMjpeg');
       mjpegEl.textContent = mjpegReady ? 'ON' : 'OFF';
       mjpegEl.className = 'value ' + (mjpegReady ? 'green' : '');
@@ -657,8 +702,8 @@
       setBadge('badge-mjpeg', mjpegReady);
 
       // FLV
-      const flvRunning = flv.source_running || false;
-      const flvReady = flv.source_ready || false;
+      const flvRunning = flv.source_running || flv.running || false;
+      const flvReady = flv.source_ready || flv.ready || false;
       const flvClients = flv.clients || 0;
       const flvEl = document.getElementById('kpiFlv');
       flvEl.textContent = flvRunning ? 'ON' : 'OFF';

@@ -29,6 +29,73 @@ make
 
 默认构建不会编译 `rtsp_server.cpp`，也不会检测或链接 GStreamer。此时仍然包含 HTTP、线程池、V4L2 采集和 MJPEG。
 
+如果在 PC 或虚拟机里交叉编译，可以让 SDK 直接注入 `CC/CXX`，也可以手动传 `CROSS_COMPILE`：
+
+```bash
+make clean
+make CROSS_COMPILE=arm-linux-gnueabihf-
+```
+
+如果交叉编译器由板厂 SDK 提供，通常更推荐让 SDK 调用本项目 `makefile`，传入 `TARGET_CC`、`TARGET_CXX`、`TARGET_CFLAGS`、`TARGET_LDFLAGS`。项目已经提供 `install` 目标，可以安装到一个临时 rootfs：
+
+```bash
+make install DESTDIR=/path/to/rootfs
+```
+
+安装后会生成：
+
+```text
+/path/to/rootfs/usr/bin/webserver_camera
+/path/to/rootfs/usr/share/webserver_camera/
+```
+
+程序启动时会优先使用环境变量 `WEBSERVER_CAMERA_RESOURCES` 指定的资源目录；如果没有指定，会先按开发目录结构查找 `../resources`，再回退到 `/usr/share/webserver_camera`。
+
+## 打包进 img
+
+只执行本项目的 `make`，只能证明应用被编译成了可执行文件，不能证明它已经进入最终烧录镜像。完整链路应该是：
+
+```text
+源码 -> 交叉编译出 webserver_camera -> 安装进 rootfs -> SDK 打包 rootfs -> 生成 img
+```
+
+如果使用 Tina/OpenWrt 风格 SDK，可以参考：
+
+```text
+packaging/tina/Makefile
+```
+
+接入方式通常是：
+
+```bash
+mkdir -p package/allwinner/webserver_camera/src
+cp packaging/tina/Makefile package/allwinner/webserver_camera/Makefile
+cp -r include src resources tools tests makefile package/allwinner/webserver_camera/src/
+make menuconfig
+make package/webserver_camera/compile V=s
+make
+pack
+```
+
+具体命令以你的 SDK 为准。关键点是：package Makefile 的 `Package/webserver_camera/install` 阶段必须把程序复制到 `$(1)/usr/bin/`，把网页资源复制到 `$(1)/usr/share/webserver_camera/`。`$(1)` 可以理解成 SDK 正在准备的 rootfs 目录。
+
+判断应用是否真的进了 img，可以用两个办法。烧录后在板子上执行：
+
+```bash
+which webserver_camera
+find / -name webserver_camera 2>/dev/null
+sha256sum /usr/bin/webserver_camera
+```
+
+也可以在打包前检查 SDK 的 rootfs 目录：
+
+```bash
+find /path/to/rootfs -name webserver_camera
+sha256sum /path/to/rootfs/usr/bin/webserver_camera
+```
+
+如果 rootfs 或板子里找不到 `/usr/bin/webserver_camera`，那就说明它还没有被安装进镜像；这时不是重新写业务代码，而是修 SDK 的 package Makefile 或安装规则。
+
 MJPEG 地址为：
 
 ```text
@@ -78,7 +145,13 @@ make test-media
 
 这条路径要求设备支持 `V4L2_PIX_FMT_H264`。如果启动日志里枚举的 V4L2 格式没有 `H264`，说明摄像头不能直接给 HTTP-FLV 使用；此时服务会记录错误并保持 `/live.flv` 不可用，而不会自动回退到测试文件。
 
-如果摄像头只支持 MJPEG/YUYV/NV12，那么正确的第六阶段路线是接入硬件编码器：采集线程拿到原始或压缩图像帧，编码器输出 H264 NAL，HTTP-FLV 层继续复用现在的 `IH264Source -> FlvMuxer -> StreamManager -> http_conn` 分发链路。
+### MIPI/CSI 和 H264 的关系
+
+MIPI CSI-2 可以理解成“摄像头传感器把图像数据送进 SoC 的高速通道”。它解决的是传输问题，不解决视频压缩编码问题。H264 则是编码后的压缩码流，它通常来自 SoC 内部的视频编码器、VPU、ISP 后面的编码模块，或者一个独立的 USB/IP 编码设备。
+
+所以不要把“MIPI 摄像头”直接等同于“能输出 H264 的视频源”。很多 MIPI 传感器经 V4L2 暴露出来的是 RAW、YUYV、NV12、MJPEG 这类图像格式；只有当某个 V4L2 节点明确支持 `V4L2_PIX_FMT_H264`，这个节点才适合直接接入当前 HTTP-FLV 链路。
+
+如果摄像头只支持 MJPEG/YUYV/NV12，那么正确路线是接入硬件编码器：采集线程拿到原始或压缩图像帧，编码器输出 H264 NAL，HTTP-FLV 层继续复用现在的 `IH264Source -> FlvMuxer -> StreamManager -> http_conn` 分发链路。
 
 注意：如果用 `v4l2:/dev/video0` 作为 HTTP-FLV 的 H264 源，主程序会跳过原来的 MJPEG 采集线程，避免两个线程同时打开同一个 V4L2 设备。
 
@@ -93,6 +166,8 @@ http://设备IP:端口/live.flv
 ```bash
 ffplay http://设备IP:端口/live.flv
 ```
+
+浏览器不能像播放 MP4 那样直接播放 FLV 文件。项目页面通过 flv.js 把 HTTP-FLV 长连接里的 FLV/H264 数据解析出来，再交给浏览器的 MediaSource Extensions 播放。首页 `/index.html` 和 `/monitor.html` 都已经内置 HTTP-FLV 播放入口。如果 flv.js CDN 加载失败，或者浏览器不支持 MSE live FLV，页面会显示明确错误；这种情况下可以先用 `ffplay` 验证服务端 `/live.flv` 是否正常。
 
 控制 API：
 
