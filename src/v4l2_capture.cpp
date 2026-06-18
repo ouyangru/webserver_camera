@@ -6,7 +6,9 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/videodev2.h>
+#include <errno.h>
 #include <vector>
 #include "v4l2_capture.h"
 #include "shared_buffer.h"
@@ -47,6 +49,67 @@ static void print_supported_formats(int fd) {
     }
 }
 
+static void dump_debug_jpeg_frame(const std::vector<unsigned char>& frame,
+                                  uint32_t driver_sequence) {
+    static bool initialized = false;
+    static int dump_limit = 0;
+    static int dumped_count = 0;
+    static char dump_dir[256] = "/tmp/mjpeg_frames";
+
+    if (!initialized) {
+        initialized = true;
+
+        const char* limit_env = getenv("MJPEG_DUMP_FRAMES");
+        if (limit_env) {
+            dump_limit = atoi(limit_env);
+        }
+
+        const char* dir_env = getenv("MJPEG_DUMP_DIR");
+        if (dir_env && dir_env[0] != '\0') {
+            snprintf(dump_dir, sizeof(dump_dir), "%s", dir_env);
+        }
+
+        if (dump_limit > 0) {
+            if (mkdir(dump_dir, 0755) < 0 && errno != EEXIST) {
+                fprintf(stderr, "[V4L2] failed to create dump dir %s: %s\n",
+                        dump_dir, strerror(errno));
+                dump_limit = 0;
+            } else {
+                printf("[V4L2] dumping first %d published MJPEG frames to %s\n",
+                       dump_limit, dump_dir);
+            }
+        }
+    }
+
+    if (dump_limit <= 0 || dumped_count >= dump_limit) {
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/frame_%04d_seq_%u_%zu.jpg",
+             dump_dir, dumped_count + 1, driver_sequence, frame.size());
+
+    FILE* fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "[V4L2] failed to dump %s: %s\n",
+                path, strerror(errno));
+        return;
+    }
+
+    size_t written = fwrite(frame.data(), 1, frame.size(), fp);
+    fclose(fp);
+
+    if (written != frame.size()) {
+        fprintf(stderr, "[V4L2] short dump write %s: %zu/%zu\n",
+                path, written, frame.size());
+        return;
+    }
+
+    dumped_count++;
+    printf("[V4L2] dumped MJPEG frame %d/%d: %s\n",
+           dumped_count, dump_limit, path);
+}
+
 static void publish_frame(const std::vector<unsigned char>& frame,
                           uint32_t pixel_format,
                           uint32_t driver_sequence) {
@@ -65,6 +128,9 @@ static void publish_frame(const std::vector<unsigned char>& frame,
                    (unsigned long)small_frame_count);
         }
         return;
+    }
+    if (pixel_format == V4L2_PIX_FMT_MJPEG) {
+        dump_debug_jpeg_frame(frame, driver_sequence);
     }
 
     pthread_mutex_lock(&g_frame.lock);
