@@ -403,6 +403,8 @@ std::string StreamManager::status_json() {
     size_t frame_len = g_frame.length;
     int pixel_format = g_frame.pixel_format;
     pthread_mutex_unlock(&g_frame.lock);
+    bool mjpeg_ready = frame_len > 0 &&
+                       pixel_format == static_cast<int>(V4L2_PIX_FMT_MJPEG);
 
     lock();
     m_mjpeg_stats.clients = m_mjpeg_clients.size();
@@ -410,13 +412,15 @@ std::string StreamManager::status_json() {
     m_flv_stats.running = m_flv_running;
     m_flv_stats.ready = m_flv_ready;
 
-    char buf[1024];
+    char buf[2048];
     snprintf(buf, sizeof(buf),
              "{"
              "\"mjpeg\":{\"clients\":%zu,\"frame_bytes\":%zu,"
-             "\"pixel_format\":%d,\"frames\":%llu,\"bytes\":%llu,"
+             "\"pixel_format\":%d,\"ready\":%s,\"source_ready\":%s,"
+             "\"frames\":%llu,\"bytes\":%llu,"
              "\"enqueued\":%llu,\"dropped\":%llu},"
              "\"flv\":{\"clients\":%zu,\"running\":%s,\"ready\":%s,"
+             "\"source_running\":%s,\"source_ready\":%s,"
              "\"source\":\"%s\",\"active_source\":\"%s\","
              "\"last_error\":\"%s\","
              "\"fps\":%.2f,\"frames\":%llu,"
@@ -424,11 +428,15 @@ std::string StreamManager::status_json() {
              "\"enqueued\":%llu,\"dropped\":%llu}"
              "}\n",
              m_mjpeg_clients.size(), frame_len, pixel_format,
+             mjpeg_ready ? "true" : "false",
+             mjpeg_ready ? "true" : "false",
              static_cast<unsigned long long>(m_mjpeg_stats.frames),
              static_cast<unsigned long long>(m_mjpeg_stats.bytes),
              static_cast<unsigned long long>(m_mjpeg_stats.enqueued_packets),
              static_cast<unsigned long long>(m_mjpeg_stats.dropped_packets),
              m_flv_clients.size(),
+             m_flv_running ? "true" : "false",
+             m_flv_ready ? "true" : "false",
              m_flv_running ? "true" : "false",
              m_flv_ready ? "true" : "false",
              json_escape(m_flv_input_path).c_str(),

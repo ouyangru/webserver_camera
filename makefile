@@ -1,6 +1,13 @@
 # 因为文件中既有 C 文件也有 C++ 文件，所以分别指定编译器。
-CC ?= gcc
-CXX ?= g++
+# 交叉编译时可以传 CROSS_COMPILE，例如：
+#   make CROSS_COMPILE=arm-linux-gnueabihf-
+# 或直接传 SDK 注入的 CC/CXX：
+#   make CC="$(TARGET_CC)" CXX="$(TARGET_CXX)"
+CROSS_COMPILE ?=
+CC ?= $(CROSS_COMPILE)gcc
+CXX ?= $(CROSS_COMPILE)g++
+AR ?= $(CROSS_COMPILE)ar
+STRIP ?= $(CROSS_COMPILE)strip
 PKG_CONFIG ?= pkg-config
 ENABLE_GSTREAMER ?= 0
 
@@ -15,6 +22,12 @@ SRC_DIR=src
 OBJ_DIR=obj
 BIN_DIR=bin
 TOOLS_DIR=tools
+RES_DIR=resources
+PREFIX ?= /usr
+BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share/webserver_camera
+TARGET_NAME ?= my_program
+INSTALL_NAME ?= webserver_camera
 
 # 默认只构建 HTTP、线程池、V4L2 和 MJPEG。
 # rtsp_server.cpp 依赖 GStreamer，只有 ENABLE_GSTREAMER=1 时才加入构建。
@@ -33,7 +46,7 @@ endif
 C_OBJS=$(C_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
 CPP_OBJS=$(CPP_SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
-TARGET=$(BIN_DIR)/my_program
+TARGET=$(BIN_DIR)/$(TARGET_NAME)
 FLV_TOOL=$(BIN_DIR)/h264_to_flv
 FLV_TOOL_OBJ=$(OBJ_DIR)/h264_to_flv_tool.o
 FLV_MEDIA_OBJS=$(OBJ_DIR)/h264_parser.o $(OBJ_DIR)/flv_muxer.o
@@ -65,6 +78,15 @@ $(MEDIA_TEST_OBJ): tests/media_pipeline_test.cpp
 test-media: $(MEDIA_TEST)
 	./$(MEDIA_TEST)
 
+install: $(TARGET)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/$(INSTALL_NAME)
+	install -d $(DESTDIR)$(DATADIR)
+	cp -r $(RES_DIR)/* $(DESTDIR)$(DATADIR)/
+
+strip: $(TARGET)
+	$(STRIP) $(TARGET)
+
 # C 文件编译规则
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	mkdir -p $(OBJ_DIR)
@@ -76,6 +98,6 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -rf $(OBJ_DIR)/*.o $(BIN_DIR)/my_program $(BIN_DIR)/h264_to_flv $(MEDIA_TEST)
+	rm -rf $(OBJ_DIR)/*.o $(BIN_DIR)/$(TARGET_NAME) $(BIN_DIR)/h264_to_flv $(MEDIA_TEST)
 
-.PHONY: all clean test-media
+.PHONY: all clean install strip test-media

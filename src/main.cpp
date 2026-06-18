@@ -50,6 +50,15 @@ bool uses_default_v4l2_device(const char* source) {
 // 通过 /proc/self/exe 获取可执行文件真实路径，自动推导 resources 目录
 // 规则：可执行文件在 bin/ 下，resources 在 ../resources（相对于可执行文件目录）
 static std::string get_resources_path() {
+    const char* env_path = getenv("WEBSERVER_CAMERA_RESOURCES");
+    if (env_path && env_path[0] != '\0') {
+        char resolved_env[PATH_MAX];
+        if (realpath(env_path, resolved_env) != NULL) {
+            return std::string(resolved_env);
+        }
+        return std::string(env_path);
+    }
+
     char exe_path[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", exe_path, PATH_MAX - 1);
     if (len == -1) {
@@ -70,8 +79,11 @@ static std::string get_resources_path() {
     // 规范化路径（解析 ../ 等）
     char resolved[PATH_MAX];
     if (realpath(resources_dir.c_str(), resolved) == NULL) {
-        // 目录不存在，返回拼接后的原始路径（后续检查会失败并报错）
-        return resources_dir;
+        const char* installed_resources_dir = "/usr/share/webserver_camera";
+        if (realpath(installed_resources_dir, resolved) != NULL) {
+            return std::string(resolved);
+        }
+        return resources_dir; // 后续检查会失败并报出原始推导路径
     }
     return std::string(resolved);
 }
