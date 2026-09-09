@@ -1,5 +1,5 @@
 #include "http_conn.h"
-#include "stream_log.h"
+#include "logger.h"
 
 #include "shared_buffer.h"
 #include "stream_manager.h"
@@ -176,6 +176,7 @@ void http_conn::init()
 // 循环读取客户数据，直到无数据可读或者对方关闭连接
 bool http_conn::read() {
     if( m_read_idx >= READ_BUFFER_SIZE ) {
+        LOG_WARN("http", "event=read_rejected fd=%d reason=buffer_full bytes=%d", m_sockfd, m_read_idx);
         return false;
     }
     int bytes_read = 0;
@@ -185,14 +186,18 @@ bool http_conn::read() {
         READ_BUFFER_SIZE - m_read_idx, 0 );
         if (bytes_read == -1) {
             if( errno == EAGAIN || errno == EWOULDBLOCK ) {
+                LOG_TRACE("http", "event=read_would_block fd=%d buffered=%d", m_sockfd, m_read_idx);
                 // 没有数据
                 break;
             }
+            LOG_DEBUG("http", "event=read_failed fd=%d errno=%d", m_sockfd, errno);
             return false;   
         } else if (bytes_read == 0) {   // 对方关闭连接
+            LOG_DEBUG("http", "event=peer_eof fd=%d buffered=%d", m_sockfd, m_read_idx);
             return false;
         }
         m_read_idx += bytes_read;
+        LOG_TRACE("http", "event=read fd=%d bytes=%d buffered=%d", m_sockfd, bytes_read, m_read_idx);
     }
     return true;
 }
@@ -208,6 +213,7 @@ http_conn::PacketQueueResult http_conn::enqueue_packet(
     bool dropped_existing = false;
     pthread_mutex_lock(&m_send_lock);
     if (m_sockfd == -1 || max_queue_depth == 0) {
+        LOG_DEBUG("queue", "event=reject fd=%d reason=closed_or_disabled limit=%zu", m_sockfd, max_queue_depth);
         pthread_mutex_unlock(&m_send_lock);
         return PACKET_DROPPED;
     }
@@ -236,6 +242,7 @@ http_conn::PacketQueueResult http_conn::enqueue_packet(
 
         if (drop_index == m_send_queue.size()) {
             if (droppable) {
+                LOG_DEBUG("queue", "event=reject fd=%d reason=no_droppable_slot queue=%zu limit=%zu offset=%zu", m_sockfd, m_send_queue.size(), max_queue_depth, m_send_offset);
                 pthread_mutex_unlock(&m_send_lock);
                 return PACKET_DROPPED;
             }
@@ -268,6 +275,7 @@ http_conn::PacketQueueResult http_conn::enqueue_flv_packet(
 
     pthread_mutex_lock(&m_send_lock);
     if (m_sockfd == -1 || m_conn_type != CONN_FLV) {
+        LOG_DEBUG("queue", "event=reject_flv fd=%d reason=closed_or_wrong_type", m_sockfd);
         pthread_mutex_unlock(&m_send_lock);
         return PACKET_DROPPED;
     }
@@ -414,7 +422,7 @@ http_conn::HTTP_CODE http_conn::parse_headers(char* text) {
         text += strspn( text, " \t" );
         m_host = text;
     } else {
-        printf( "oop! unknow header %s\n", text );
+        LOG_TRACE("http", "event=header_ignored fd=%d", m_sockfd);
     }
     return NO_REQUEST;
 }
@@ -440,7 +448,7 @@ http_conn::HTTP_CODE http_conn::process_read() {
         // 获取一行数据
         text = get_line();
         m_start_line = m_checked_idx;
-        printf( "got 1 http line: %s\n", text );
+        LOG_TRACE("http", "event=parse_line fd=%d state=%d", m_sockfd, static_cast<int>(m_check_state));
 
         switch ( m_check_state ) {
             case CHECK_STATE_REQUESTLINE: {
@@ -480,6 +488,7 @@ http_conn::HTTP_CODE http_conn::process_read() {
 // 映射到内存地址m_file_address处，并告诉调用者获取文件成功
 http_conn::HTTP_CODE http_conn::do_request()
 {
+    LOG_DEBUG("http", "event=route fd=%d path=%.256s", m_sockfd, m_url);
     if (strcmp(m_url, "/mjpeg") == 0) {
         if (!m_stream_manager || !m_stream_manager->is_mjpeg_source_ready()) {
             return SERVICE_UNAVAILABLE;
@@ -611,6 +620,7 @@ bool http_conn::write_stream() {
             continue;
         }
         const size_t requested = packet->size() - m_send_offset;
+        LOG_TRACE("send", "event=send_start fd=%d packet=%p offset=%zu requested=%zu", m_sockfd, static_cast<void*>(packet.get()), m_send_offset, requested);
         const unsigned long long begin_us = stream_log::monotonic_us();
         const ssize_t sent = send(m_sockfd, packet->data() + m_send_offset, requested, 0);
         const int error = sent < 0 ? errno : 0;
@@ -686,7 +696,7 @@ bool http_conn::build_json_response(const std::string& body) {
 
 bool http_conn::start_mjpeg_stream() {
     if (!m_stream_manager) {
-        fprintf(stderr, "[MJPEG] start failed: no stream_manager, fd=%d\n", m_sockfd);
+        LOG_ERROR("http", "event=stream_start_failed protocol=mjpeg fd=%d reason=no_manager", m_sockfd);
         return false;
     }
 
@@ -705,16 +715,17 @@ bool http_conn::start_mjpeg_stream() {
     // MJPEG 队列深度设为 10：响应头(不可丢弃) + 最多9帧 JPEG
     // 队列满时丢弃最旧的 JPEG 帧(可丢弃)，保留响应头和最新帧
     if (enqueue_packet(packet, 10, false) == PACKET_DROPPED) {
-        fprintf(stderr, "[MJPEG] start failed: enqueue dropped, fd=%d\n", m_sockfd);
+        LOG_WARN("http", "event=stream_start_failed protocol=mjpeg fd=%d reason=header_rejected", m_sockfd);
         return false;
     }
     m_stream_manager->add_mjpeg_client(this);
-    printf("[MJPEG] stream started, fd=%d, enqueued HTTP header\n", m_sockfd);
+    LOG_INFO("http", "event=stream_started protocol=mjpeg fd=%d", m_sockfd);
     return true;
 }
 
 bool http_conn::start_flv_stream() {
     if (!m_stream_manager || !m_stream_manager->is_flv_source_ready()) {
+        LOG_WARN("http", "event=stream_start_failed protocol=flv fd=%d reason=source_unavailable", m_sockfd);
         return false;
     }
 
@@ -732,6 +743,7 @@ bool http_conn::start_flv_stream() {
     std::shared_ptr<Packet> flv_header = m_stream_manager->make_flv_header_packet();
     std::shared_ptr<Packet> sequence_header = m_stream_manager->make_flv_sequence_header_packet();
     if (!flv_header || !sequence_header) {
+        LOG_WARN("http", "event=stream_start_failed protocol=flv fd=%d reason=missing_headers", m_sockfd);
         return false;
     }
 
@@ -741,10 +753,12 @@ bool http_conn::start_flv_stream() {
     if (enqueue_packet(http_header, 3, false) == PACKET_DROPPED ||
         enqueue_flv_packet(flv_header) == PACKET_DROPPED ||
         enqueue_flv_packet(sequence_header) == PACKET_DROPPED) {
+        LOG_WARN("http", "event=stream_start_failed protocol=flv fd=%d reason=header_rejected", m_sockfd);
         return false;
     }
 
     m_stream_manager->add_flv_client(this);
+    LOG_INFO("http", "event=stream_started protocol=flv fd=%d wait_keyframe=1", m_sockfd);
     return true;
 }
 
@@ -764,6 +778,7 @@ bool http_conn::write()
 
     while (m_bytes_to_send > 0) {
         // 分散写
+        LOG_TRACE("http", "event=write_start fd=%d remaining=%zu offset=%zu", m_sockfd, m_bytes_to_send, m_bytes_have_sent);
         ssize_t temp = writev(m_sockfd, m_iv, m_iv_count);
         if (temp < 0) {
             if (errno == EINTR) {
@@ -772,19 +787,23 @@ bool http_conn::write()
             // 如果TCP写缓冲没有空间，则等待下一轮EPOLLOUT事件，虽然在此期间，
             // 服务器无法立即接收到同一客户的下一个请求，但可以保证连接的完整性。
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                LOG_TRACE("http", "event=write_would_block fd=%d remaining=%zu", m_sockfd, m_bytes_to_send);
                 modfd( m_epollfd, m_sockfd, EPOLLOUT );
                 return true;
             }
+            LOG_DEBUG("http", "event=write_failed fd=%d errno=%d", m_sockfd, errno);
             unmap();
             return false;
         }
 
         if (temp == 0) {
+            LOG_WARN("http", "event=zero_write fd=%d remaining=%zu", m_sockfd, m_bytes_to_send);
             return false;
         }
 
         m_bytes_have_sent += static_cast<size_t>(temp);
         m_bytes_to_send -= static_cast<size_t>(temp);
+        LOG_TRACE("http", "event=write_progress fd=%d sent=%zd remaining=%zu partial=%d", m_sockfd, temp, m_bytes_to_send, m_bytes_to_send > 0);
 
         if (m_bytes_have_sent >= static_cast<size_t>(m_write_idx)) {
             m_iv[0].iov_len = 0;
@@ -803,6 +822,7 @@ bool http_conn::write()
         }
     }
 
+    LOG_TRACE("http", "event=response_complete fd=%d bytes=%zu keepalive=%d", m_sockfd, m_bytes_have_sent, m_linger);
     // 发送HTTP响应成功，根据HTTP请求中的Connection字段决定是否立即关闭连接
     unmap();
     if (m_linger) {
@@ -831,6 +851,7 @@ bool http_conn::add_response( const char* format, ... ) {
 }
 
 bool http_conn::add_status_line( int status, const char* title ) {
+    LOG_DEBUG("http", "event=response_status fd=%d status=%d", m_sockfd, status);
     return add_response( "%s %d %s\r\n", "HTTP/1.1", status, title );
 }
 
@@ -950,8 +971,10 @@ bool http_conn::process_write(HTTP_CODE ret) {
 
 // 由线程池中的工作线程调用，这是处理HTTP请求的入口函数
 void http_conn::process() {
+    LOG_TRACE("threadpool", "event=process_begin fd=%d", m_sockfd);
     // 解析HTTP请求
     HTTP_CODE read_ret = process_read();
+    LOG_DEBUG("http", "event=parse_result fd=%d result=%d", m_sockfd, static_cast<int>(read_ret));
     if ( read_ret == NO_REQUEST ) {
         modfd( m_epollfd, m_sockfd, EPOLLIN );
         return;

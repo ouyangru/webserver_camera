@@ -21,7 +21,7 @@
 #include "rtsp_server.h"
 #endif
 #include "stream_manager.h"
-#include "stream_log.h"
+#include "logger.h"
 
 
 #define MAX_FD 65536   // 最大的文件描述符个数
@@ -112,18 +112,20 @@ int main( int argc, char* argv[] ) {
     std::string resources_dir = get_resources_path();
     struct stat st;
     if (stat(resources_dir.c_str(), &st) == -1 || !S_ISDIR(st.st_mode)) {
-        printf("资源目录不存在！请创建：%s\n", resources_dir.c_str());
+        LOG_ERROR("main", "event=resources_unavailable path=%s", resources_dir.c_str());
         return 1;
     }
     http_conn::set_doc_root(resources_dir);
-    printf("[main] resources dir: %s\n", resources_dir.c_str());
+    LOG_INFO("main", "event=resources path=%s", resources_dir.c_str());
 
     // 获取端口号
     int port = atoi( argv[1] );
     if (port <= 0 || port > 65535) {
-        fprintf(stderr, "invalid port: %s\n", argv[1]);
+        LOG_ERROR("main", "event=invalid_port value=%s", argv[1]);
         return 1;
     }
+
+    LOG_INFO("main", "event=server_start port=%d", port);
 
     // 对SIGPIE信号进行处理
     addsig( SIGPIPE, SIG_IGN );
@@ -133,6 +135,7 @@ int main( int argc, char* argv[] ) {
     try {
         pool = new threadpool<http_conn>;
     } catch( ... ) {
+        LOG_ERROR("main", "event=threadpool_create_failed");
         return 1;
     }
 
@@ -143,7 +146,7 @@ int main( int argc, char* argv[] ) {
     // 创建一个数组 用于保存所有的客户端信息
     http_conn* users = new (std::nothrow) http_conn[MAX_FD];
     if (!users) {
-        fprintf(stderr, "failed to allocate connection table\n");
+        LOG_ERROR("main", "event=connection_table_allocation_failed");
         delete pool;
         return 1;
     }
@@ -152,7 +155,7 @@ int main( int argc, char* argv[] ) {
     // 创建监听套接字
     int listenfd = socket( PF_INET, SOCK_STREAM, 0 );
     if (listenfd < 0) {
-        perror("socket");
+        LOG_ERROR("main", "event=socket_failed errno=%d", errno);
         delete [] users;
         delete pool;
         return 1;
@@ -169,7 +172,7 @@ int main( int argc, char* argv[] ) {
     setsockopt( listenfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof( reuse ) );
     ret = bind( listenfd, ( struct sockaddr* )&address, sizeof( address ) );
     if (ret < 0) {
-        perror("bind");
+        LOG_ERROR("main", "event=bind_failed errno=%d", errno);
         close(listenfd);
         delete [] users;
         delete pool;
@@ -179,18 +182,20 @@ int main( int argc, char* argv[] ) {
     // 监听
     ret = listen( listenfd, 5 );
     if (ret < 0) {
-        perror("listen");
+        LOG_ERROR("main", "event=listen_failed errno=%d", errno);
         close(listenfd);
         delete [] users;
         delete pool;
         return 1;
     }
 
+    LOG_INFO("main", "event=listening fd=%d port=%d backlog=5", listenfd, port);
+
     // 创建epoll对象，和事件数组，添加
     epoll_event events[ MAX_EVENT_NUMBER ];
     int epollfd = epoll_create1(0);
     if (epollfd < 0) {
-        perror("epoll_create1");
+        LOG_ERROR("main", "event=epoll_create1_failed errno=%d", errno);
         close(listenfd);
         delete [] users;
         delete pool;
@@ -248,7 +253,7 @@ int main( int argc, char* argv[] ) {
         int number = epoll_wait( epollfd, events, MAX_EVENT_NUMBER, -1 );
         
         if ( ( number < 0 ) && ( errno != EINTR ) ) {
-            printf( "epoll failure\n" );
+            LOG_ERROR("epoll", "event=wait_failed epollfd=%d errno=%d", epollfd, errno);
             break;
         }
 
@@ -263,13 +268,24 @@ int main( int argc, char* argv[] ) {
                 int connfd = accept( listenfd, ( struct sockaddr* )&client_address, &client_addrlength );
                 
                 if ( connfd < 0 ) {
-                    printf( "errno is: %d\n", errno );
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                        LOG_TRACE("main", "event=accept_retry listen_fd=%d errno=%d", listenfd, errno);
+                    } else {
+                        LOG_ERROR("main", "event=accept_failed listen_fd=%d errno=%d", listenfd, errno);
+                    }
                     continue;
                 } 
+
+                char peer[INET_ADDRSTRLEN] = {};
+                const char* peer_text = inet_ntop(AF_INET, &client_address.sin_addr, peer, sizeof(peer));
+                LOG_INFO("main", "event=accept listen_fd=%d fd=%d peer=%s port=%u",
+                         listenfd, connfd, peer_text ? peer_text : "unknown",
+                         static_cast<unsigned int>(ntohs(client_address.sin_port)));
 
                 if (connfd >= MAX_FD || http_conn::m_user_count.load() >= MAX_FD) {
                     // 目前连接数满了
                     // 给客户端写一个信息： 服务器正忙
+                    LOG_WARN("main", "event=reject fd=%d reason=connection_limit clients=%d", connfd, http_conn::m_user_count.load());
                     close(connfd);
                     continue;
                 }
@@ -277,13 +293,17 @@ int main( int argc, char* argv[] ) {
                 users[connfd].init( connfd, client_address);
             
             } else if( events[i].events & ( EPOLLRDHUP | EPOLLHUP | EPOLLERR ) ) {
+                LOG_DEBUG("epoll", "event=disconnect fd=%d events=%u", sockfd, events[i].events);
                 // 对方异常断开或错误等事件
                 users[sockfd].close_conn();
 
             } else if(events[i].events & EPOLLIN) {
+                LOG_TRACE("epoll", "event=readable fd=%d events=%u", sockfd, events[i].events);
                 // 一次性把全部数据读完
                 if(users[sockfd].read()) {
+                    LOG_TRACE("threadpool", "event=submit fd=%d", sockfd);
                     if (!pool->append(users + sockfd)) {
+                        LOG_WARN("threadpool", "event=submit_failed fd=%d reason=stopped_or_full", sockfd);
                         users[sockfd].close_conn();
                     }
                 } else {
@@ -301,6 +321,7 @@ int main( int argc, char* argv[] ) {
         }
     }
     
+    LOG_INFO("main", "event=server_stop listen_fd=%d", listenfd);
     close( listenfd );
     // 先等待工作线程退出；它们结束前仍可能调用 modfd()。
     delete pool;
