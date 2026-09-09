@@ -21,6 +21,7 @@
 #include "rtsp_server.h"
 #endif
 #include "stream_manager.h"
+#include "stream_log.h"
 
 
 #define MAX_FD 65536   // 最大的文件描述符个数
@@ -290,6 +291,7 @@ int main( int argc, char* argv[] ) {
                 }
 
             }  else if( events[i].events & EPOLLOUT ) {
+                LOG_TRACE("epoll", "event=writable fd=%d events=%u", sockfd, events[i].events);
                 // 一次性把全部数据写完
                 if( !users[sockfd].write() ) {
                     users[sockfd].close_conn();

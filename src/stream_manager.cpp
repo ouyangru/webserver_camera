@@ -1,4 +1,5 @@
 #include "stream_manager.h"
+#include "stream_log.h"
 
 #include <algorithm>
 #include <stdio.h>
@@ -74,6 +75,7 @@ void StreamManager::add_mjpeg_client(http_conn* client) {
         }
     }
     m_mjpeg_clients.push_back(client);
+    LOG_INFO("stream", "event=register protocol=mjpeg client=%p clients=%zu", static_cast<void*>(client), m_mjpeg_clients.size());
     m_mjpeg_stats.clients = m_mjpeg_clients.size();
     unlock();
 
@@ -98,6 +100,7 @@ void StreamManager::add_flv_client(http_conn* client) {
         }
     }
     m_flv_clients.push_back(client);
+    LOG_INFO("stream", "event=register protocol=flv client=%p clients=%zu", static_cast<void*>(client), m_flv_clients.size());
     m_flv_stats.clients = m_flv_clients.size();
     unlock();
 }
@@ -110,6 +113,7 @@ void StreamManager::remove_client(http_conn* client) {
     lock();
     for (size_t i = 0; i < m_mjpeg_clients.size(); ++i) {
         if (m_mjpeg_clients[i] == client) {
+            LOG_INFO("stream", "event=remove protocol=mjpeg client=%p", static_cast<void*>(client));
             m_mjpeg_clients.erase(m_mjpeg_clients.begin() + i);
             removed_mjpeg = true;
             break;
@@ -117,6 +121,7 @@ void StreamManager::remove_client(http_conn* client) {
     }
     for (size_t i = 0; i < m_flv_clients.size(); ++i) {
         if (m_flv_clients[i] == client) {
+            LOG_INFO("stream", "event=remove protocol=flv client=%p", static_cast<void*>(client));
             m_flv_clients.erase(m_flv_clients.begin() + i);
             break;
         }
@@ -278,24 +283,7 @@ void StreamManager::broadcast_mjpeg_packet(const std::shared_ptr<std::vector<uns
         }
     }
 
-    // 前5帧或每100帧打详细诊断
-    {
-        static int detail_count = 0;
-        ++detail_count;
-        if (detail_count <= 5 || detail_count % 100 == 0) {
-            printf("[MJPEG] broadcast result: clients=%zu enqueued=%zu dropped=%zu\n",
-                   clients.size(), enqueued, dropped);
-        }
-    }
-
-    if (enqueued == 0 && m_mjpeg_stats.frames > 3) {
-        static int warn_count = 0;
-        if (++warn_count % 100 == 0) {
-            printf("[MJPEG] WARNING: broadcast frame #%llu but enqueued=0, dropped=%zu, clients=%d\n",
-                   (unsigned long long)m_mjpeg_stats.frames, dropped, (int)clients.size());
-        }
-    }
-
+    LOG_TRACE("stream", "event=broadcast protocol=mjpeg packet=%p bytes=%zu clients=%zu enqueued=%zu dropped_clients=%zu", static_cast<void*>(packet.get()), packet->size(), clients.size(), enqueued, dropped);
 
     lock();
     m_enqueued_packets += enqueued;

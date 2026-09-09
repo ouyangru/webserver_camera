@@ -1,4 +1,5 @@
 #include "http_conn.h"
+#include "stream_log.h"
 
 #include "shared_buffer.h"
 #include "stream_manager.h"
@@ -68,7 +69,13 @@ void modfd(int epollfd, int fd, int ev) {
     epoll_event event;
     event.data.fd = fd;
     event.events = ev | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;
-    epoll_ctl( epollfd, EPOLL_CTL_MOD, fd, &event );
+    const int result = epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
+    const int error = result < 0 ? errno : 0;
+    if (result < 0) {
+        LOG_ERROR("epoll", "event=rearm_failed fd=%d events=%u errno=%d", fd, event.events, error);
+    } else {
+        LOG_TRACE("epoll", "event=rearm fd=%d events=%u", fd, event.events);
+    }
 }
 
 // 所有的客户数
@@ -102,6 +109,7 @@ void http_conn::close_conn() {
     pthread_mutex_lock(&m_send_lock);
     int fd = m_sockfd;
     if (fd != -1) {
+        LOG_INFO("http", "event=close fd=%d queue=%zu offset=%zu", fd, m_send_queue.size(), m_send_offset);
         m_sockfd = -1;
         m_send_queue.clear();
         m_send_offset = 0;
@@ -122,6 +130,7 @@ void http_conn::close_conn() {
 void http_conn::init(int sockfd, const sockaddr_in& addr){
     m_sockfd = sockfd;
     m_address = addr;
+    LOG_INFO("http", "event=connect fd=%d", sockfd);
     
     // 端口复用
     int reuse = 1;
@@ -208,6 +217,7 @@ http_conn::PacketQueueResult http_conn::enqueue_packet(
         for (size_t i = m_send_queue.size(); i > first_droppable; --i) {
             size_t index = i - 1;
             if (m_send_queue[index].droppable) {
+                LOG_DEBUG("queue", "event=drop fd=%d reason=replace_stale packet=%p queue=%zu", m_sockfd, static_cast<void*>(m_send_queue[index].data.get()), m_send_queue.size());
                 m_send_queue.erase(m_send_queue.begin() + index);
                 dropped_existing = true;
             }
@@ -232,6 +242,7 @@ http_conn::PacketQueueResult http_conn::enqueue_packet(
             break;
         }
 
+        LOG_DEBUG("queue", "event=drop fd=%d reason=queue_limit packet=%p queue=%zu", m_sockfd, static_cast<void*>(m_send_queue[drop_index].data.get()), m_send_queue.size());
         m_send_queue.erase(m_send_queue.begin() + drop_index);
         if (drop_index == 0) {
             m_send_offset = 0;
@@ -239,6 +250,7 @@ http_conn::PacketQueueResult http_conn::enqueue_packet(
         dropped_existing = true;
     }
     m_send_queue.push_back(QueuedPacket(packet, droppable));
+    LOG_TRACE("queue", "event=enqueue fd=%d packet=%p bytes=%zu queue=%zu dropped_existing=%d", m_sockfd, static_cast<void*>(packet.get()), packet->size(), m_send_queue.size(), dropped_existing);
     pthread_mutex_unlock(&m_send_lock);
 
     notify_write();
@@ -261,11 +273,13 @@ http_conn::PacketQueueResult http_conn::enqueue_flv_packet(
     }
 
     if (m_wait_flv_key_frame && !packet->is_config && !packet->is_key_frame) {
+        LOG_DEBUG("queue", "event=drop_flv fd=%d reason=wait_keyframe", m_sockfd);
         pthread_mutex_unlock(&m_send_lock);
         return PACKET_DROPPED;
     }
 
     if (m_send_queue.size() >= max_queue_depth) {
+        LOG_DEBUG("queue", "event=drop_flv fd=%d reason=queue_limit count=%zu offset=%zu", m_sockfd, m_send_queue.size(), m_send_offset);
         m_send_queue.clear();
         m_send_offset = 0;
         m_wait_flv_key_frame = true;
@@ -281,6 +295,7 @@ http_conn::PacketQueueResult http_conn::enqueue_flv_packet(
     }
 
     m_send_queue.push_back(QueuedPacket(packet->data, false));
+    LOG_TRACE("queue", "event=enqueue_flv fd=%d packet=%p bytes=%zu queue=%zu key=%d config=%d dropped_existing=%d", m_sockfd, static_cast<void*>(packet->data.get()), packet->size(), m_send_queue.size(), packet->is_key_frame, packet->is_config, dropped_existing);
     pthread_mutex_unlock(&m_send_lock);
 
     notify_write();
@@ -576,93 +591,64 @@ void http_conn::unmap() {
 }
 
 bool http_conn::write_stream() {
-    static uint64_t total_packets_sent = 0;
     while (true) {
         pthread_mutex_lock(&m_send_lock);
         if (m_sockfd == -1) {
             pthread_mutex_unlock(&m_send_lock);
             return false;
         }
-
         if (m_send_queue.empty()) {
+            LOG_TRACE("send", "event=queue_empty fd=%d", m_sockfd);
             modfd(m_epollfd, m_sockfd, EPOLLIN | EPOLLRDHUP);
             pthread_mutex_unlock(&m_send_lock);
             return true;
         }
-
-        std::shared_ptr<std::vector<unsigned char>> packet =
-            m_send_queue.front().data;
-        if (!packet || packet->empty()) {
+        std::shared_ptr<std::vector<unsigned char>> packet = m_send_queue.front().data;
+        if (!packet || packet->empty() || m_send_offset >= packet->size()) {
             m_send_queue.pop_front();
             m_send_offset = 0;
             pthread_mutex_unlock(&m_send_lock);
             continue;
         }
-
-        if (m_send_offset >= packet->size()) {
-            m_send_queue.pop_front();
-            m_send_offset = 0;
-            pthread_mutex_unlock(&m_send_lock);
-            continue;
-        }
-
-        bool is_new_packet = (m_send_offset == 0);
-        if (is_new_packet) {
-            total_packets_sent++;
-            // 对较大的包（帧数据）打印日志
-            if (packet->size() > 256 && (total_packets_sent <= 5 || total_packets_sent % 100 == 0)) {
-                printf("[SEND] fd=%d pkt#%llu size=%zu queue=%zu\n",
-                       m_sockfd, (unsigned long long)total_packets_sent,
-                       packet->size(), m_send_queue.size());
-                // 打印包的前32字节（hex）
-                printf("[SEND] first32=");
-                for (size_t b = 0; b < 32 && b < packet->size(); b++)
-                    printf("%02X ", (*packet)[b]);
-                printf("\n");
-            }
-        }
-
-        ssize_t sent = send(m_sockfd,
-                            packet->data() + m_send_offset,
-                            packet->size() - m_send_offset,
-                            0);
+        const size_t requested = packet->size() - m_send_offset;
+        const unsigned long long begin_us = stream_log::monotonic_us();
+        const ssize_t sent = send(m_sockfd, packet->data() + m_send_offset, requested, 0);
+        const int error = sent < 0 ? errno : 0;
+        const unsigned long long elapsed_us = stream_log::monotonic_us() - begin_us;
+        LOG_TRACE("send", "event=send fd=%d packet=%p requested=%zu sent=%zd offset=%zu queue=%zu errno=%d elapsed_us=%llu",
+                  m_sockfd, static_cast<void*>(packet.get()), requested, sent,
+                  m_send_offset, m_send_queue.size(), error, elapsed_us);
         if (sent < 0) {
-            if (errno == EINTR) {
+            if (error == EINTR) {
                 pthread_mutex_unlock(&m_send_lock);
                 continue;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                printf("[SEND] fd=%d EAGAIN at offset=%zu/%zu pkt#%llu\n",
-                       m_sockfd, m_send_offset, packet->size(),
-                       (unsigned long long)total_packets_sent);
+            if (error == EAGAIN || error == EWOULDBLOCK) {
+                LOG_TRACE("send", "event=would_block fd=%d offset=%zu bytes=%zu", m_sockfd, m_send_offset, packet->size());
                 modfd(m_epollfd, m_sockfd, EPOLLIN | EPOLLOUT | EPOLLRDHUP);
                 pthread_mutex_unlock(&m_send_lock);
                 return true;
             }
+            LOG_ERROR("send", "event=failed fd=%d errno=%d", m_sockfd, error);
             pthread_mutex_unlock(&m_send_lock);
             return false;
         }
-
         if (sent == 0) {
+            LOG_WARN("send", "event=zero_write fd=%d requested=%zu", m_sockfd, requested);
             pthread_mutex_unlock(&m_send_lock);
             return false;
         }
-
         m_send_offset += static_cast<size_t>(sent);
         if (m_send_offset >= packet->size()) {
-            if (packet->size() > 256 && total_packets_sent <= 5) {
-                printf("[SEND] fd=%d pkt#%llu COMPLETE size=%zu\n",
-                       m_sockfd, (unsigned long long)total_packets_sent,
-                       packet->size());
-            }
+            LOG_TRACE("send", "event=complete fd=%d packet=%p bytes=%zu", m_sockfd, static_cast<void*>(packet.get()), packet->size());
             m_send_queue.pop_front();
             m_send_offset = 0;
+        } else {
+            LOG_TRACE("send", "event=partial fd=%d packet=%p offset=%zu bytes=%zu", m_sockfd, static_cast<void*>(packet.get()), m_send_offset, packet->size());
         }
         pthread_mutex_unlock(&m_send_lock);
     }
-    return true;
 }
-
 bool http_conn::build_status_response() {
     if (!m_stream_manager) {
         return false;
