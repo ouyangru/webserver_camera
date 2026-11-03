@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+START=95
+STOP=10
+
+start() {
+    export WEBSERVER_LOG_LEVEL=INFO
+    export WEBSERVER_LOG_FILE=/tmp/webserver_camera.log
+    export CV_ENABLE=1
+    start-stop-daemon -S -b -m -p /var/run/webserver_camera.pid \
+        -x /usr/bin/webserver_camera -- 10000 cedar
+}
+
+stop() {
+    start-stop-daemon -K -p /var/run/webserver_camera.pid
+}

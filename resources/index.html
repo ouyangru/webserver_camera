@@ -287,11 +287,19 @@
       </button>
     </div>
 
+    <div style="padding:12px;display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+      <label><input type="checkbox" id="detectPerson"> 人形检测</label>
+      <label><input type="checkbox" id="detectObjects"> 物品检测（COCO 类别）</label>
+      <label title="关闭时仅显示完全同帧的推理结果；开启后允许沿用过去250ms内的框"><input type="checkbox" id="detectHold"> 平滑保持旧框（最多250ms）</label>
+      <span id="detectionInfo">检测已关闭 · 普通直播</span>
+    </div>
     <div class="video-container" id="videoContainer">
       <!-- MJPEG: 浏览器原生支持 img src 显示 multipart/x-mixed-replace -->
       <img id="mjpegImg" src="" alt="MJPEG Stream" style="display:block;width:100%;height:100%;object-fit:contain;background:#000;">
+      <canvas id="mjpegCanvas" style="display:none;width:100%;height:100%"></canvas>
       <!-- FLV -->
       <video id="flvView" controls autoplay muted playsinline style="display:none;width:100%;height:100%;"></video>
+      <canvas id="detectionCanvas" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:2"></canvas>
       <!-- HLS -->
       <video id="hlsView" controls autoplay muted playsinline style="display:none;width:100%;height:100%;"></video>
 
@@ -368,6 +376,13 @@
       </div>
     </div>
 
+    <div class="card">
+      <div class="card-title">Performance / 性能</div>
+      <pre id="perfStats" style="white-space:pre-wrap;font-size:12px;line-height:1.6">Waiting for metrics…</pre>
+      <div id="bufferStats" style="font-size:12px">Browser buffer: —</div>
+      <label style="font-size:12px"><input id="liveCatchup" type="checkbox" checked> 自动追赶直播（缓冲超过 1.5s）</label>
+      <div style="font-size:11px;color:var(--muted)">缓冲领先量不是摄像头到屏幕的完整延迟。</div>
+    </div>
     <!-- API Control -->
     <div class="card">
       <div class="card-title">FLV Source Control</div>
@@ -390,6 +405,7 @@
     <div class="card">
       <div class="card-title">Quick Links</div>
       <div class="quick-links">
+        <a href="/cv.html"><span class="icon">&#9678;</span> NPU 人形检测</a>
         <a href="/mjpeg" target="_blank"><span class="icon">&#9679;</span> Raw MJPEG Stream</a>
         <a href="/live.flv" target="_blank"><span class="icon">&#9654;</span> FLV Stream (need player)</a>
         <a href="/live" target="_blank"><span class="icon">&#9654;</span> HLS Playlist</a>
@@ -412,7 +428,9 @@
 <div class="toast-container" id="toastContainer"></div>
 
 <!-- flv.js -->
-<script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+<script src="/flv.min.js"></script>
+<script src="/detection.js"></script>
+<script src="/mjpeg-view.js"></script>
 <!-- hls.js -->
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.11/dist/hls.min.js"></script>
 
@@ -424,6 +442,7 @@
   let statusInterval = null;
   let clockInterval = null;
   let flvRecoverTimer = null;
+  let lastCatchupAt = 0;
   let startTime = Date.now();
 
   // MJPEG: 浏览器原生支持 img src 解析 multipart/x-mixed-replace
@@ -436,6 +455,7 @@
     const cls = type === 'ok' ? 'log-ok' : type === 'err' ? 'log-err' : type === 'info' ? 'log-info' : '';
     box.innerHTML += '<div class="' + cls + '">[' + ts + '] ' + msg + '</div>';
     box.scrollTop = box.scrollHeight;
+    while (box.childElementCount > 100) box.firstElementChild.remove();
   }
 
   // ---- Toast ----
@@ -460,6 +480,8 @@
 
     // Show/hide views
     document.getElementById('mjpegImg').style.display = tab === 'mjpeg' ? 'block' : 'none';
+    document.getElementById('mjpegImg').style.display='none';
+    document.getElementById('mjpegCanvas').style.display=tab==='mjpeg'?'block':'none';
     document.getElementById('flvView').style.display  = tab === 'flv'    ? 'block' : 'none';
     document.getElementById('hlsView').style.display   = tab === 'hls'    ? 'block' : 'none';
     document.getElementById('placeholder').style.display = 'none';
@@ -469,15 +491,19 @@
     // Start player
     if (tab === 'mjpeg') {
       const img = document.getElementById('mjpegImg');
-      img.src = '/mjpeg';
       img.onerror = () => {
+        if (currentTab !== 'mjpeg') return;
         showPlaceholder('MJPEG stream unavailable - is the camera running?');
         log('MJPEG stream error', 'err');
       };
       img.onload = () => {
+        if (currentTab !== 'mjpeg') return;
         document.getElementById('placeholder').style.display = 'none';
       };
-      log('Switched to MJPEG stream (native img)', 'info');
+      MjpegView.start(document.getElementById('mjpegCanvas'),stamp=>DetectionOverlay.mjpegFrame(stamp),err=>{
+        log('MJPEG stream error: '+err.message,'err');showPlaceholder('MJPEG stream error: '+err.message);
+      });
+      log('Switched to MJPEG with frame timestamps', 'info');
     } else if (tab === 'flv') {
       startFlvPlayer();
       log('Switched to HTTP-FLV stream', 'info');
@@ -488,9 +514,15 @@
   }
 
   function stopCurrentPlayer() {
+    MjpegView.stop();DetectionOverlay.detach();
     // MJPEG - 清空 img src 停止流
     var mjpegImg = document.getElementById('mjpegImg');
-    if (mjpegImg) { mjpegImg.src = ''; mjpegImg.style.display = 'none'; }
+    if (mjpegImg) {
+      mjpegImg.onerror = null;
+      mjpegImg.onload = null;
+      mjpegImg.removeAttribute('src');
+      mjpegImg.style.display = 'none';
+    }
 
     // FLV
     if (flvPlayer) {
@@ -551,20 +583,27 @@
       lazyLoad: false,
       deferLoadAfterSourceOpen: false,
       autoCleanupSourceBuffer: true,
+      autoCleanupMaxBackwardDuration: 15,
+      autoCleanupMinBackwardDuration: 5,
     });
+    const player=flvPlayer;
+    let failed=false;
     flvPlayer.attachMediaElement(video);
-    flvPlayer.load();
-    flvPlayer.play().catch((err) => {
-      log('FLV autoplay blocked or delayed: ' + err.message, 'err');
-    });
+    DetectionOverlay.attach(flvPlayer,video);
     flvPlayer.on(flvjs.Events.ERROR, (type, detail, info) => {
+      if(player!==flvPlayer||currentTab!=='flv'||failed)return;
+      failed=true;
       const message = type + (detail ? '/' + detail : '');
-      log('FLV player error: ' + message, 'err');
+      const media=video.error;
+      const diagnostic=(media?' code='+media.code+' '+media.message:'')+' '+(info&&(info.msg||info.message)||'');
+      log('FLV player error: ' + message + diagnostic, 'err');
       toast('FLV stream error: ' + message, 'error');
+      // Stop further appendBuffer calls against a failed MediaSource immediately.
+      try{player.pause();player.unload();}catch(e){}
       if (!flvRecoverTimer && currentTab === 'flv') {
         flvRecoverTimer = setTimeout(() => {
           flvRecoverTimer = null;
-          if (currentTab === 'flv') {
+          if (currentTab === 'flv' && player===flvPlayer) {
             log('Retrying HTTP-FLV stream...', 'info');
             switchTab('flv');
           }
@@ -572,7 +611,13 @@
       }
     });
     flvPlayer.on(flvjs.Events.LOADING_COMPLETE, () => {
+      if(player!==flvPlayer||failed)return;
       log('FLV loading complete', 'info');
+    });
+    player.load();
+    player.play().catch(err=>{
+      if(player!==flvPlayer||failed||currentTab!=='flv'||err.name==='AbortError')return;
+      log('FLV play failed: '+err.message,'err');
     });
     log('FLV player started', 'ok');
   }
@@ -682,6 +727,17 @@
     try {
       const r = await fetch('/api/status');
       const d = await r.json();
+      const p = d.performance || {};
+      const q = p.queues || {};
+      const stages = p.stages_ms || {};
+      const fmt = n => Number.isFinite(n) ? n.toFixed(1) : '—';
+      document.getElementById('perfStats').textContent =
+        `CPU ${fmt(p.cpu_pct)}%  RSS ${fmt(p.rss_kb/1024)} MiB\n` +
+        `可用 ${fmt(p.available_kb/1024)} MiB  H264 ${fmt(p.encoded_fps)} fps\n` +
+        `编码 P95 ${fmt(stages.encode?.p95)} ms\n` +
+        `输入→封装 P95 ${fmt(stages.encoder_input_to_mux?.p95)} ms\n` +
+        `编码队列 ${q.encoder_frames ?? '—'} 帧 / ${fmt(q.encoder_oldest_ms)} ms\n` +
+        `发送队列 ${q.send_packets ?? '—'} 包 / ${fmt(q.send_oldest_ms)} ms`;
 
       // KPI
       const clients = d.http_clients || 0;
@@ -761,6 +817,27 @@
   }
 
   // ---- Clock & Uptime ----
+  function monitorPlayback() {
+    const v = document.getElementById('flvView');
+    if (currentTab !== 'flv' || !v.buffered.length) {
+      document.getElementById('bufferStats').textContent = 'Browser buffer: —';
+      return;
+    }
+    const last = v.buffered.length - 1;
+    const end = v.buffered.end(last);
+    const ahead = Math.max(0, end-v.currentTime);
+    document.getElementById('bufferStats').textContent = `Browser buffer: ${ahead.toFixed(2)} s`;
+    if (document.getElementById('liveCatchup').checked && !v.paused && !v.seeking &&
+        v.readyState >= 2 && ahead > 1.5 && Date.now()-lastCatchupAt > 5000) {
+      const target = Math.max(v.buffered.start(last), end-0.6);
+      if (target > v.currentTime) {
+        lastCatchupAt=Date.now();
+        v.currentTime=target;
+        log(`直播追赶：积压 ${ahead.toFixed(2)}s`, 'info');
+      }
+    }
+  }
+
   function updateClock() {
     const now = new Date();
     document.getElementById('clockDisplay').textContent = now.toLocaleTimeString();
@@ -781,6 +858,7 @@
     // Start status polling every 2s
     fetchStatus();
     statusInterval = setInterval(fetchStatus, 2000);
+    setInterval(monitorPlayback,1000);
 
     // Clock
     updateClock();
@@ -788,7 +866,7 @@
     startTime = Date.now();
 
     // Default tab
-    switchTab('mjpeg');
+    switchTab('flv');
   }
 
   init();

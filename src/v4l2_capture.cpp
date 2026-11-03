@@ -166,14 +166,16 @@ static bool find_jpeg_marker(const unsigned char* data,
     return false;
 }
 
-void* v4l2_thread_func(void* arg) {
-    int fd = open(VIDEO_DEV, O_RDWR);
+void* v4l2_singleplane_thread_func(void* arg) {
+    const char* video_device = getenv("VIDEO_DEVICE");
+    if (!video_device || !*video_device) video_device = VIDEO_DEV;
+    int fd = open(video_device, O_RDWR);
     if (fd < 0) {
         perror("V4L2 Open");
         fprintf(stderr, "[V4L2] Capture disabled; HTTP service will continue running.\n");
         return NULL;
     }
-    printf("[V4L2] 摄像头设备 %s 已打开，开始实时采集...\n", VIDEO_DEV);
+    printf("[V4L2] 摄像头设备 %s 已打开，开始实时采集...\n", video_device);
     print_supported_formats(fd);
 
     // 设置输出为 MJPEG 优先，失败后回退 NV12/YUYV
@@ -191,6 +193,8 @@ void* v4l2_thread_func(void* arg) {
             fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
             if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
                 perror("VIDIOC_S_FMT YUYV");
+                close(fd);
+                return NULL;
             }
         }
     }

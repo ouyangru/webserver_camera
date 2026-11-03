@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+START=96
+STOP=9
+start() {
+    # Current camera is mounted upside down. Override in /etc/webserver_cv.conf.
+    export CV_ROTATE=180
+    [ ! -f /etc/webserver_cv.conf ] || . /etc/webserver_cv.conf
+    mkdir -p /usr/share/webserver_camera/models
+    start-stop-daemon -S -b -m -p /var/run/webserver_cv.pid -x /usr/bin/webserver_cv -- \
+        /usr/share/webserver_camera/models/100ASK_humandet_384_224_V1.nb
+}
+stop() {
+    start-stop-daemon -K -p /var/run/webserver_cv.pid
+}

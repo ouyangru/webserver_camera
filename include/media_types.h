@@ -13,6 +13,7 @@ struct Packet {
     bool is_key_frame;
     bool is_config;
     uint64_t timestamp_ms;
+    uint64_t source_mono_us = 0;
 
     Packet()
         : is_key_frame(false), is_config(false), timestamp_ms(0) {}
@@ -30,6 +31,7 @@ struct Packet {
 
 struct H264Nal {
     std::vector<uint8_t> data; // 不包含 Annex-B 起始码
+    uint64_t source_mono_us = 0; // Capture dequeue time when available; not sensor exposure time.
 
     int type() const {
         return data.empty() ? -1 : (data[0] & 0x1F);

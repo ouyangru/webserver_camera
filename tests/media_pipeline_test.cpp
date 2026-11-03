@@ -76,6 +76,17 @@ int main() {
     ok &= expect(video && video->is_key_frame,
                  "IDR access unit must produce a key-frame FLV tag");
 
+    H264AccessUnitAssembler live_assembler;
+    H264Nal live_frame = make_slice(0x65, 0x80);
+    live_frame.source_mono_us = 123456;
+    H264Nal aud; aud.data = {0x09, 0xf0};
+    H264AccessUnit live_unit;
+    ok &= expect(!live_assembler.push(live_frame, live_unit), "live slice is pending until frame boundary");
+    ok &= expect(live_assembler.push(aud, live_unit), "AUD must flush without waiting for the next frame");
+    ok &= expect(live_unit.nals.size() == 1 && live_unit.nals[0].source_mono_us == 123456,
+                 "frame metadata must survive assembly");
+    ok &= expect(!live_assembler.flush(live_unit), "AUD-flushed frame must not be emitted twice");
+
     if (!ok) {
         return 1;
     }

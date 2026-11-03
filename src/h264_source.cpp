@@ -1,4 +1,5 @@
 #include "h264_source.h"
+#include "h264_encoder.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -305,6 +306,7 @@ bool V4L2H264Source::next_nal(H264Nal& nal) {
 
 std::unique_ptr<IH264Source> create_h264_source(const std::string& uri,
                                                 uint32_t fps) {
+    if (uri == "cedar") return create_cedar_h264_source();
     if (starts_with(uri, "v4l2:")) {
         V4L2H264SourceConfig config;
         config.device = uri.substr(strlen("v4l2:"));

@@ -1,4 +1,6 @@
 #include "stream_manager.h"
+#include "stream_log.h"
+#include "pipeline_metrics.h"
 
 #include <algorithm>
 #include <stdio.h>
@@ -74,6 +76,7 @@ void StreamManager::add_mjpeg_client(http_conn* client) {
         }
     }
     m_mjpeg_clients.push_back(client);
+    LOG_INFO("stream", "event=register protocol=mjpeg client=%p clients=%zu", static_cast<void*>(client), m_mjpeg_clients.size());
     m_mjpeg_stats.clients = m_mjpeg_clients.size();
     unlock();
 
@@ -98,6 +101,7 @@ void StreamManager::add_flv_client(http_conn* client) {
         }
     }
     m_flv_clients.push_back(client);
+    LOG_INFO("stream", "event=register protocol=flv client=%p clients=%zu", static_cast<void*>(client), m_flv_clients.size());
     m_flv_stats.clients = m_flv_clients.size();
     unlock();
 }
@@ -110,6 +114,7 @@ void StreamManager::remove_client(http_conn* client) {
     lock();
     for (size_t i = 0; i < m_mjpeg_clients.size(); ++i) {
         if (m_mjpeg_clients[i] == client) {
+            LOG_INFO("stream", "event=remove protocol=mjpeg client=%p", static_cast<void*>(client));
             m_mjpeg_clients.erase(m_mjpeg_clients.begin() + i);
             removed_mjpeg = true;
             break;
@@ -117,6 +122,7 @@ void StreamManager::remove_client(http_conn* client) {
     }
     for (size_t i = 0; i < m_flv_clients.size(); ++i) {
         if (m_flv_clients[i] == client) {
+            LOG_INFO("stream", "event=remove protocol=flv client=%p", static_cast<void*>(client));
             m_flv_clients.erase(m_flv_clients.begin() + i);
             break;
         }
@@ -278,24 +284,7 @@ void StreamManager::broadcast_mjpeg_packet(const std::shared_ptr<std::vector<uns
         }
     }
 
-    // 前5帧或每100帧打详细诊断
-    {
-        static int detail_count = 0;
-        ++detail_count;
-        if (detail_count <= 5 || detail_count % 100 == 0) {
-            printf("[MJPEG] broadcast result: clients=%zu enqueued=%zu dropped=%zu\n",
-                   clients.size(), enqueued, dropped);
-        }
-    }
-
-    if (enqueued == 0 && m_mjpeg_stats.frames > 3) {
-        static int warn_count = 0;
-        if (++warn_count % 100 == 0) {
-            printf("[MJPEG] WARNING: broadcast frame #%llu but enqueued=0, dropped=%zu, clients=%d\n",
-                   (unsigned long long)m_mjpeg_stats.frames, dropped, (int)clients.size());
-        }
-    }
-
+    LOG_TRACE("stream", "event=broadcast protocol=mjpeg packet=%p bytes=%zu clients=%zu enqueued=%zu dropped_clients=%zu", static_cast<void*>(packet.get()), packet->size(), clients.size(), enqueued, dropped);
 
     lock();
     m_enqueued_packets += enqueued;
@@ -456,6 +445,7 @@ std::string StreamManager::status_json() {
 
 void StreamManager::run_flv_source() {
     uint64_t frame_index = 0;
+    uint64_t live_origin_us = 0;
 
     while (true) {
         lock();
@@ -496,8 +486,21 @@ void StreamManager::run_flv_source() {
         H264AccessUnitAssembler assembler;
         H264Nal nal;
         bool config_dirty = false;
+        std::vector<uint8_t> last_sps, last_pps;
 
         const uint32_t sleep_us = 1000000u / std::max<uint32_t>(fps, 1);
+        const bool live = input_path == "cedar" || input_path.compare(0,5,"v4l2:")==0;
+        auto timestamp_for = [&](const H264AccessUnit& unit) -> uint64_t {
+            if (!live) return frame_index * 1000 / fps;
+            uint64_t time = perf_now_us();
+            for (const auto& n : unit.nals) if (n.is_vcl() && n.source_mono_us) {
+                time=n.source_mono_us;
+                perf_observe("encoder_input_to_mux",perf_now_us()-time);
+                break;
+            }
+            if (!live_origin_us) live_origin_us=time;
+            return (time-live_origin_us)/1000;
+        };
 
         while (source->next_nal(nal)) {
             lock();
@@ -510,18 +513,22 @@ void StreamManager::run_flv_source() {
             if (nal.is_sps() || nal.is_pps()) {
                 H264AccessUnit completed;
                 if (assembler.flush(completed) && !completed.empty() && local_muxer.ready()) {
-                    uint64_t timestamp = frame_index * 1000 / fps;
+                    uint64_t timestamp = timestamp_for(completed);
                     completed.dts_ms = timestamp;
                     completed.pts_ms = timestamp;
                     std::shared_ptr<Packet> pkt = local_muxer.make_video_tag(completed);
                     broadcast_flv_packet(pkt);
                     ++frame_index;
-                    usleep(sleep_us);
+                    if (!live) usleep(sleep_us);
                 }
 
                 if (nal.is_sps()) {
+                    if (nal.data == last_sps) continue;
+                    last_sps = nal.data;
                     local_muxer.set_sps(nal.data);
                 } else {
+                    if (nal.data == last_pps) continue;
+                    last_pps = nal.data;
                     local_muxer.set_pps(nal.data);
                 }
 
@@ -547,7 +554,7 @@ void StreamManager::run_flv_source() {
                 continue;
             }
 
-            uint64_t timestamp = frame_index * 1000 / fps;
+            uint64_t timestamp = timestamp_for(completed);
             completed.dts_ms = timestamp;
             completed.pts_ms = timestamp;
 
@@ -566,17 +573,17 @@ void StreamManager::run_flv_source() {
 
             broadcast_flv_packet(local_muxer.make_video_tag(completed));
             ++frame_index;
-            usleep(sleep_us);
+            if (!live) usleep(sleep_us);
         }
 
         H264AccessUnit completed;
         if (!stop_requested && assembler.flush(completed) && !completed.empty() && local_muxer.ready()) {
-            uint64_t timestamp = frame_index * 1000 / fps;
+            uint64_t timestamp = timestamp_for(completed);
             completed.dts_ms = timestamp;
             completed.pts_ms = timestamp;
             broadcast_flv_packet(local_muxer.make_video_tag(completed));
             ++frame_index;
-            usleep(sleep_us);
+            if (!live) usleep(sleep_us);
         }
     }
 
@@ -602,6 +609,7 @@ void* mjpeg_stream_thread(void* arg) {
     while (true) {
         std::vector<unsigned char> chunk;
         uint64_t sequence = 0;
+        uint64_t capture_mono_us = 0;
 
         pthread_mutex_lock(&g_frame.lock);
         while (g_frame.sequence == last_sequence) {
@@ -609,6 +617,7 @@ void* mjpeg_stream_thread(void* arg) {
         }
         last_sequence = g_frame.sequence;
         sequence = last_sequence;
+        capture_mono_us = g_frame.capture_mono_us;
 
         if (g_frame.length == 0 ||
             g_frame.pixel_format != static_cast<int>(V4L2_PIX_FMT_MJPEG)) {
@@ -686,12 +695,13 @@ void* mjpeg_stream_thread(void* arg) {
             }
 
             size_t jpeg_len = assembling.size();
-            char header_buf[128];
+            char header_buf[256];
             int header_len = snprintf(header_buf, sizeof(header_buf),
                                       "--%s\r\n"
                                       "Content-Type: image/jpeg\r\n"
-                                      "Content-Length: %zu\r\n\r\n",
-                                      kMjpegBoundary, jpeg_len);
+                                      "Content-Length: %zu\r\n"
+                                      "X-Capture-Mono-Us: %llu\r\n\r\n",
+                                      kMjpegBoundary, jpeg_len,(unsigned long long)capture_mono_us);
             if (header_len <= 0) {
                 assembling.clear();
                 continue;

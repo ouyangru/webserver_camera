@@ -5,6 +5,7 @@ SharedFrame g_frame = {
     .length = 0,
     .pixel_format = 0,
     .sequence = 0,
+    .capture_mono_us = 0,
     .client_count = 0,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cond_new_frame = PTHREAD_COND_INITIALIZER,

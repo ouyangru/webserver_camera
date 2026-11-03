@@ -15,6 +15,7 @@ Thumbs.db
 bin/
 obj/
 build/
+build-v853/
 cmake-build-*/
 *.o
 *.obj

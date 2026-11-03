@@ -139,5 +139,7 @@ std::shared_ptr<Packet> FlvMuxer::make_video_tag(
         make_flv_tag(0x09, static_cast<uint32_t>(access_unit.dts_ms), payload));
     packet->is_key_frame = key_frame;
     packet->timestamp_ms = access_unit.dts_ms;
+    for (const auto& nal : access_unit.nals)
+        if (nal.is_vcl() && nal.source_mono_us) { packet->source_mono_us = nal.source_mono_us; break; }
     return packet;
 }

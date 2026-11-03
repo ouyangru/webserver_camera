@@ -10,13 +10,30 @@ AR ?= $(CROSS_COMPILE)ar
 STRIP ?= $(CROSS_COMPILE)strip
 PKG_CONFIG ?= pkg-config
 ENABLE_GSTREAMER ?= 0
+ENABLE_CEDAR ?= 0
+override CPPFLAGS += -DENABLE_CEDAR=$(ENABLE_CEDAR)
+override LDLIBS += -ldl
+ifeq ($(ENABLE_CEDAR),1)
+override CPPFLAGS += -I$(CEDARC_ROOT)/include -I$(CEDARC_ROOT)/base/include -I$(CEDARC_ROOT)/memory/include
+override LDFLAGS += -L$(CEDARC_LIBDIR) -Wl,-rpath-link,$(CEDARC_LIBDIR)
+override LDFLAGS += -Wl,-rpath,'$$ORIGIN/../lib:$$ORIGIN/../lib/webserver_camera'
+override LDLIBS += -lvencoder -lMemAdapter
+endif
+ENABLE_JPEG ?= 0
+override CPPFLAGS += -DENABLE_JPEG=$(ENABLE_JPEG)
+ifeq ($(ENABLE_JPEG),1)
+override LDLIBS += -ljpeg
+endif
 
-CFLAGS ?= -Wall -O2
-CXXFLAGS ?= -Wall -O2
-CFLAGS += -Iinclude
-CXXFLAGS += -std=c++11 -Iinclude
-CXXFLAGS += -DENABLE_GSTREAMER=$(ENABLE_GSTREAMER)
-LDFLAGS += -lpthread -lstdc++
+CPPFLAGS ?=
+CFLAGS ?= -O2
+CXXFLAGS ?= -O2
+LDFLAGS ?=
+LDLIBS ?=
+override CPPFLAGS += -Iinclude -DENABLE_GSTREAMER=$(ENABLE_GSTREAMER)
+override CFLAGS += -Wall
+override CXXFLAGS += -Wall -std=c++11
+override LDLIBS += -lpthread
 
 SRC_DIR=src
 OBJ_DIR=obj
@@ -39,8 +56,8 @@ GST_PACKAGES=gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0
 GST_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(GST_PACKAGES))
 GST_LIBS := $(shell $(PKG_CONFIG) --libs $(GST_PACKAGES))
 CPP_SRCS += $(SRC_DIR)/rtsp_server.cpp
-CXXFLAGS += $(GST_CFLAGS)
-LDFLAGS += $(GST_LIBS)
+override CPPFLAGS += $(GST_CFLAGS)
+override LDLIBS += $(GST_LIBS)
 endif
 
 C_OBJS=$(C_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
@@ -57,26 +74,26 @@ all: $(TARGET) $(FLV_TOOL)
 
 $(TARGET): $(C_OBJS) $(CPP_OBJS)
 	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^ $(LDFLAGS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(FLV_TOOL): $(FLV_TOOL_OBJ) $(FLV_MEDIA_OBJS)
 	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(FLV_TOOL_OBJ): $(TOOLS_DIR)/h264_to_flv.cpp
 	mkdir -p $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(MEDIA_TEST): $(MEDIA_TEST_OBJ) $(FLV_MEDIA_OBJS)
 	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(MEDIA_TEST_OBJ): tests/media_pipeline_test.cpp
 	mkdir -p $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 test-media: $(MEDIA_TEST)
-	./$(MEDIA_TEST)
+	$(abspath $(MEDIA_TEST))
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
@@ -90,12 +107,12 @@ strip: $(TARGET)
 # C 文件编译规则
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	mkdir -p $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 # C++ 文件编译规则
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	mkdir -p $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 clean:
 	rm -rf $(OBJ_DIR)/*.o $(BIN_DIR)/$(TARGET_NAME) $(BIN_DIR)/h264_to_flv $(MEDIA_TEST)

@@ -1,103 +1,79 @@
-# 因为文件中既有 C 文件也有 C++ 文件，所以分别指定编译器。
-# 交叉编译时可以传 CROSS_COMPILE，例如：
-#   make CROSS_COMPILE=arm-linux-gnueabihf-
-# 或直接传 SDK 注入的 CC/CXX：
-#   make CC="$(TARGET_CC)" CXX="$(TARGET_CXX)"
-CROSS_COMPILE ?=
-CC ?= $(CROSS_COMPILE)gcc
-CXX ?= $(CROSS_COMPILE)g++
-AR ?= $(CROSS_COMPILE)ar
-STRIP ?= $(CROSS_COMPILE)strip
-PKG_CONFIG ?= pkg-config
-ENABLE_GSTREAMER ?= 0
+include $(TOPDIR)/rules.mk
 
-CFLAGS ?= -Wall -O2
-CXXFLAGS ?= -Wall -O2
-CFLAGS += -Iinclude
-CXXFLAGS += -std=c++11 -Iinclude
-CXXFLAGS += -DENABLE_GSTREAMER=$(ENABLE_GSTREAMER)
-LDFLAGS += -lpthread -lstdc++
+PKG_NAME:=webserver_camera
+PKG_VERSION:=1.0
+PKG_RELEASE:=1
 
-SRC_DIR=src
-OBJ_DIR=obj
-BIN_DIR=bin
-TOOLS_DIR=tools
-RES_DIR=resources
-PREFIX ?= /usr
-BINDIR ?= $(PREFIX)/bin
-DATADIR ?= $(PREFIX)/share/webserver_camera
-TARGET_NAME ?= my_program
-INSTALL_NAME ?= webserver_camera
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
-# 默认只构建 HTTP、线程池、V4L2 和 MJPEG。
-# rtsp_server.cpp 依赖 GStreamer，只有 ENABLE_GSTREAMER=1 时才加入构建。
-C_SRCS=$(wildcard $(SRC_DIR)/*.c)
-CPP_SRCS=$(filter-out $(SRC_DIR)/rtsp_server.cpp,$(wildcard $(SRC_DIR)/*.cpp))
+include $(INCLUDE_DIR)/package.mk
 
-ifeq ($(ENABLE_GSTREAMER),1)
-GST_PACKAGES=gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0
-GST_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(GST_PACKAGES))
-GST_LIBS := $(shell $(PKG_CONFIG) --libs $(GST_PACKAGES))
-CPP_SRCS += $(SRC_DIR)/rtsp_server.cpp
-CXXFLAGS += $(GST_CFLAGS)
-LDFLAGS += $(GST_LIBS)
-endif
+define Package/$(PKG_NAME)
+  SUBMENU:=Vision
+  SECTION:=allwinner
+  CATEGORY:=Allwinner
+  MENU:=1
+  TITLE:=epoll HTTP MJPEG and HTTP-FLV camera server
+  DEPENDS:=+libstdcpp +libjpeg-turbo +libAWIspApi
+endef
 
-C_OBJS=$(C_SRCS:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
-CPP_OBJS=$(CPP_SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
+define Package/$(PKG_NAME)/description
+  A camera web server based on epoll and a thread pool. It provides
+  HTTP-MJPEG, HTTP-FLV, control APIs, and a browser dashboard.
+endef
 
-TARGET=$(BIN_DIR)/$(TARGET_NAME)
-FLV_TOOL=$(BIN_DIR)/h264_to_flv
-FLV_TOOL_OBJ=$(OBJ_DIR)/h264_to_flv_tool.o
-FLV_MEDIA_OBJS=$(OBJ_DIR)/h264_parser.o $(OBJ_DIR)/flv_muxer.o
-MEDIA_TEST=$(BIN_DIR)/media_pipeline_test
-MEDIA_TEST_OBJ=$(OBJ_DIR)/media_pipeline_test.o
+# The repository itself is the Tina package directory.  Copy only source
+# inputs into BUILD_DIR so stale host objects/binaries can never be reused.
+define Build/Prepare
+	rm -rf $(PKG_BUILD_DIR)
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(CP) ./app.mk $(PKG_BUILD_DIR)/Makefile
+	$(CP) -r ./src ./include ./resources $(PKG_BUILD_DIR)/
+	$(CP) -r ./vendor ./scripts $(PKG_BUILD_DIR)/
+	$(CP) -r ./tools $(PKG_BUILD_DIR)/
+endef
 
-all: $(TARGET) $(FLV_TOOL)
+define Build/Compile
+	TINA_SDK_ROOT="$(LICHEE_TOP_DIR)" V853_CC="$(TARGET_CC)" \
+		V853_STAGING_DIR="$(STAGING_DIR)" bash $(PKG_BUILD_DIR)/scripts/build-cedar-runtime.sh
+	$(MAKE) -C $(PKG_BUILD_DIR) \
+		ARCH="$(TARGET_ARCH)" \
+		AR="$(TARGET_AR)" \
+		CC="$(TARGET_CC)" \
+		CXX="$(TARGET_CXX)" \
+		STRIP="$(TARGET_STRIP)" \
+		CPPFLAGS="$(TARGET_CPPFLAGS) -I$(STAGING_DIR)/usr/include" \
+		CFLAGS="$(TARGET_CFLAGS)" \
+		CXXFLAGS="$(TARGET_CXXFLAGS)" \
+		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib" \
+		ENABLE_GSTREAMER=0 \
+		ENABLE_JPEG=1 \
+		ENABLE_CEDAR=1 \
+		CEDARC_ROOT="$(PKG_BUILD_DIR)/vendor/cedarc-v853" \
+		CEDARC_LIBDIR="$(PKG_BUILD_DIR)/build-v853/lib" \
+		TARGET_NAME="$(PKG_NAME)" \
+		INSTALL_NAME="$(PKG_NAME)" \
+		bin/$(PKG_NAME)
+	TINA_SDK_ROOT="$(LICHEE_TOP_DIR)" V853_CXX="$(TARGET_CXX)" \
+		STAGING_DIR="$(STAGING_DIR)" bash $(PKG_BUILD_DIR)/scripts/build-cv.sh
+endef
 
-$(TARGET): $(C_OBJS) $(CPP_OBJS)
-	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^ $(LDFLAGS)
+define Package/$(PKG_NAME)/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/$(PKG_NAME) $(1)/usr/bin/$(PKG_NAME)
+	$(INSTALL_DIR) $(1)/usr/share/webserver_camera
+	$(CP) $(PKG_BUILD_DIR)/resources/. $(1)/usr/share/webserver_camera/
+	$(INSTALL_DIR) $(1)/usr/lib/webserver_camera
+	$(CP) $(PKG_BUILD_DIR)/build-v853/lib/*.so $(1)/usr/lib/webserver_camera/
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/scripts/webserver_camera.init $(1)/etc/init.d/webserver_camera
+	ln -sf webserver_camera $(1)/etc/init.d/S95webserver_camera
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/build-v853/bin/webserver_cv $(1)/usr/bin/webserver_cv
+	$(INSTALL_DIR) $(1)/usr/share/webserver_camera/models
+	$(CP) $(PKG_BUILD_DIR)/vendor/100ask-cv/100ASK_Algo/pdet/100ASK_humandet_384_224_V1.nb $(1)/usr/share/webserver_camera/models/
+	$(CP) $(PKG_BUILD_DIR)/vendor/100ask-cv/yolo/yolov5_model.nb $(1)/usr/share/webserver_camera/models/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/scripts/webserver_cv.init $(1)/etc/init.d/webserver_cv
+	ln -sf webserver_cv $(1)/etc/init.d/S96webserver_cv
+endef
 
-$(FLV_TOOL): $(FLV_TOOL_OBJ) $(FLV_MEDIA_OBJS)
-	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^
-
-$(FLV_TOOL_OBJ): $(TOOLS_DIR)/h264_to_flv.cpp
-	mkdir -p $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(MEDIA_TEST): $(MEDIA_TEST_OBJ) $(FLV_MEDIA_OBJS)
-	mkdir -p $(BIN_DIR)
-	$(CXX) -o $@ $^
-
-$(MEDIA_TEST_OBJ): tests/media_pipeline_test.cpp
-	mkdir -p $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-test-media: $(MEDIA_TEST)
-	./$(MEDIA_TEST)
-
-install: $(TARGET)
-	install -d $(DESTDIR)$(BINDIR)
-	install -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/$(INSTALL_NAME)
-	install -d $(DESTDIR)$(DATADIR)
-	cp -r $(RES_DIR)/* $(DESTDIR)$(DATADIR)/
-
-strip: $(TARGET)
-	$(STRIP) $(TARGET)
-
-# C 文件编译规则
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
-	mkdir -p $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# C++ 文件编译规则
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
-	mkdir -p $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-clean:
-	rm -rf $(OBJ_DIR)/*.o $(BIN_DIR)/$(TARGET_NAME) $(BIN_DIR)/h264_to_flv $(MEDIA_TEST)
-
-.PHONY: all clean install strip test-media
+$(eval $(call BuildPackage,$(PKG_NAME)))

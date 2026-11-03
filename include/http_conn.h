@@ -35,7 +35,7 @@ class http_conn
 public:
     static const int FILENAME_LEN = 200;        // 文件名的最大长度
     static const int READ_BUFFER_SIZE = 2048;   // 读缓冲区的大小
-    static const int WRITE_BUFFER_SIZE = 1024;  // 写缓冲区的大小
+    static const int WRITE_BUFFER_SIZE = 8192;  // Includes bounded metrics JSON.
     
     // HTTP请求方法，这里只支持GET
     enum METHOD {GET = 0, POST, HEAD, PUT, DELETE, TRACE, OPTIONS, CONNECT};
@@ -71,6 +71,7 @@ public:
         MJPEG_REQUEST,
         FLV_REQUEST,
         STATUS_REQUEST,
+        CV_CONTROL_REQUEST,
         START_FLV_REQUEST,
         STOP_FLV_REQUEST,
         SERVICE_UNAVAILABLE
@@ -108,6 +109,7 @@ public:
     static void set_doc_root(const std::string& path);
     static const std::string& get_doc_root();
 private:
+    friend struct HttpConnTestAccess;
     void init();    // 初始化连接
     HTTP_CODE process_read();    // 解析HTTP请求
     bool process_write( HTTP_CODE ret );    // 填充HTTP应答
@@ -147,10 +149,11 @@ private:
     struct QueuedPacket {
         std::shared_ptr<std::vector<unsigned char>> data;
         bool droppable;
+        uint64_t queued_us;
 
         QueuedPacket(const std::shared_ptr<std::vector<unsigned char>>& packet,
                      bool can_drop)
-            : data(packet), droppable(can_drop) {}
+            : data(packet), droppable(can_drop), queued_us(0) {}
     };
 
     int m_sockfd;           // 该HTTP连接的socket和对方的socket地址
@@ -184,6 +187,9 @@ private:
     std::deque<QueuedPacket> m_send_queue;
     size_t m_send_offset;
     bool m_wait_flv_key_frame;
+    uint64_t m_flv_origin_ms = UINT64_MAX;
+    bool m_queue_disconnect = false;
+    void record_queue_locked();
     pthread_mutex_t m_send_lock;
 };
 
